@@ -6,13 +6,16 @@ rem  Or pass it directly:  chatime.bat 14:30
 rem ---------------------------------------------------------------
 chcp 65001 >nul
 setlocal
-if exist "%~dp0TimeTrace.exe" (
-  "%~dp0TimeTrace.exe" at %*
-) else (
-  set "PY=py"
-  where py >nul 2>nul || set "PY=python"
-  "%PY%" "%~dp0timetrace.py" at %*
-)
+if exist "%~dp0TimeTrace.exe" goto runexe
+where py >nul 2>nul && goto runpy
+python "%~dp0timetrace.py" at %*
+goto done
+:runpy
+py -3 "%~dp0timetrace.py" at %*
+goto done
+:runexe
+"%~dp0TimeTrace.exe" at %*
+:done
 echo.
 pause
 endlocal
