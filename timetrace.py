@@ -419,7 +419,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
 <div class="wrap">
   <header class="top">
     <div>
-      <h1>操作时间线</h1>
+      <h1>时迹 <span style="font-size:12px;font-weight:400;color:#98a2b3;letter-spacing:.6px">TIMETRACE</span></h1>
       <div class="sub" id="sub"></div>
     </div>
     <div class="row">
