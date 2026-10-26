@@ -16,7 +16,7 @@ RustTimeNoter 记下了你每天的电脑使用情况，但它自带的报表只
 ## 快速开始
 
 1. 先装好 **RustTimeNoter**（本工具只读它的数据，不记录任何东西）
-2. 从 [Releases](../../releases) 下载 `TimeTrace-1.0.0-win64.zip`，解压到任意位置
+2. 下载 [`TimeTrace-1.0.0-win64.zip`](../../releases/download/v1.0.0/TimeTrace-1.0.0-win64.zip)（8.6 MB，或到 [Releases](../../releases) 看所有版本），解压到任意位置
 3. 双击 **`时间线.bat`** —— 浏览器会打开时间线页面
 
 不需要安装 Python、不需要管理员权限、不写注册表、不联网。
