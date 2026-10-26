@@ -1,0 +1,1497 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+时迹 TimeTrace — RustTimeNoter 的时间线查看器
+
+RustTimeNoter 自带的报表只给"某个应用共用了多久"，看不出"几点几分在用什么"。
+本工具复用它的官方导出接口（tracker export --format json），把逐条记录合成
+"会话"，再生成一个可以按时间点查看的本地 HTML 页面。
+
+用法：
+    TimeTrace.exe html                 生成时间线并打开浏览器
+    TimeTrace.exe at "14:30"           查询某一时刻在用什么
+    TimeTrace.exe app pallas           查某个软件什么时候被用过
+    TimeTrace.exe day --date 2026-10-26  在控制台打印某天的时间流水
+    TimeTrace.exe prune --dry-run      看看哪些过期数据会被清理
+
+只用标准库，不修改 tracker 本体，也不碰加密数据文件。
+"""
+
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import unicodedata
+from collections import defaultdict
+from datetime import date, datetime, time as dtime, timedelta
+
+APP_NAME = "时迹"
+APP_NAME_EN = "TimeTrace"
+VERSION = "1.0.0"
+APP_TITLE = "时迹 · 操作时间线"
+
+# 日志保留天数：超过这个天数的数据分片会被自动删除
+RETENTION_DAYS = 30
+
+# 相邻两条同应用记录之间允许的最大缝（秒）：采样抖动导致的小缝要合并
+MERGE_GAP_SECS = 3
+
+# 常见进程 -> 友好名称（不在表里就显示去掉 .exe 的文件名）
+LABELS = {
+    "msedge.exe": "Edge 浏览器",
+    "chrome.exe": "Chrome 浏览器",
+    "firefox.exe": "Firefox 浏览器",
+    "explorer.exe": "资源管理器",
+    "WindowsTerminal.exe": "Windows 终端",
+    "cmd.exe": "命令提示符",
+    "powershell.exe": "PowerShell",
+    "pwsh.exe": "PowerShell",
+    "Code.exe": "VS Code",
+    "sublime_text.exe": "Sublime Text",
+    "Weixin.exe": "微信",
+    "WeChat.exe": "微信",
+    "QQ.exe": "QQ",
+    "QQMusic.exe": "QQ 音乐",
+    "qmbrowser.exe": "QQ 音乐·内嵌页",
+    "Doubao.exe": "豆包",
+    "DeepSeek Harness.exe": "DeepSeek Harness",
+    "Taskmgr.exe": "任务管理器",
+    "mmc.exe": "管理控制台",
+    "Notepad.exe": "记事本",
+    "StartMenuExperienceHost.exe": "开始菜单",
+    "SearchHost.exe": "Windows 搜索",
+    "ShellHost.exe": "系统外壳",
+    "CHXSmartScreen.exe": "应用防护",
+    "YdScreenCapture.exe": "有道截图",
+    "YoudaoDict.exe": "有道词典",
+    "wegame.exe": "WeGame",
+    "pallas.exe": "WeGame 组件",
+    "browser.exe": "内嵌浏览器",
+    "League of Legends.exe": "英雄联盟",
+    "LeagueClient.exe": "英雄联盟·客户端",
+    "LeagueClientUx.exe": "英雄联盟·客户端",
+    "ACE-Helper.exe": "反作弊组件",
+    "NGR-Win64-Shipping.exe": "NGR",
+}
+
+PALETTE = [
+    "#2f6ded", "#e8590c", "#0ca678", "#7048e8", "#d6336c",
+    "#f59f00", "#1c7ed6", "#37b24d", "#ae3ec9", "#e03131",
+    "#1098ad", "#5c940d", "#f76707", "#4263eb", "#c2255c",
+    "#0b7285", "#7950f2", "#2b8a3e",
+]
+
+
+# --------------------------------------------------------------------------
+# tracker 调用
+# --------------------------------------------------------------------------
+def app_dir():
+    """打包成 exe 后 __file__ 在临时解包目录里，要用 exe 自己所在的目录。"""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def find_tracker():
+    here = app_dir()
+    cands = [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustTimeNoter", "bin", "tracker.exe"),
+        os.path.join(here, "tracker.exe"),
+        os.path.join(here, "bin", "tracker.exe"),
+    ]
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    sys.exit(
+        "找不到 tracker.exe。\n"
+        "时迹读取的是 RustTimeNoter 的数据，请先安装 RustTimeNoter（双击它的 install.bat），\n"
+        "或者把 tracker.exe 放到本程序同一个文件夹里。\n"
+        "默认查找位置：%LOCALAPPDATA%\\RustTimeNoter\\bin\\tracker.exe"
+    )
+
+
+def export_records(from_day, to_day):
+    """调用 tracker export，返回原始记录列表。"""
+    tracker = find_tracker()
+    tmp_dir = tempfile.mkdtemp(prefix="rtn_timeline_")
+    out = os.path.join(tmp_dir, "export.json")
+    try:
+        cmd = [
+            tracker, "export",
+            "--format", "json",
+            "--out", out,
+            "--from", from_day.isoformat(),
+            "--to", to_day.isoformat(),
+        ]
+        proc = subprocess.run(cmd, capture_output=True)
+        if not os.path.isfile(out):
+            msg = (proc.stdout or b"") + (proc.stderr or b"")
+            sys.exit("导出失败：\n" + msg.decode("utf-8", "replace").strip())
+        with open(out, "r", encoding="utf-8") as f:
+            return json.load(f)
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def parse_start(rec):
+    try:
+        return datetime.strptime(
+            "%s %s" % (rec.get("date"), rec.get("start_time")), "%Y-%m-%d %H:%M:%S"
+        )
+    except (TypeError, ValueError):
+        ts = rec.get("start_timestamp") or ""
+        try:
+            return datetime.fromisoformat(ts).replace(tzinfo=None)
+        except ValueError:
+            return None
+
+
+def base_name(path):
+    if not path:
+        return ""
+    return re.split(r"[\\/]", path)[-1]
+
+
+# --------------------------------------------------------------------------
+# 记录 -> 按天、按会话
+# --------------------------------------------------------------------------
+def split_midnight(start, end):
+    """把跨零点的区间切成按本地自然日的若干段。"""
+    while start < end:
+        day_end = datetime.combine(start.date() + timedelta(days=1), dtime.min)
+        stop = min(end, day_end)
+        yield start, stop
+        start = stop
+
+
+def build_days(records):
+    """把逐条记录铺成"每秒前台归属"，再还原成互不重叠的会话。
+
+    tracker 的记录偶尔会区间重叠（后台短记录落在前台长记录内部）。
+    这里以"开始时间更晚的记录代表更新的状态"为准逐秒覆盖，
+    于是时间线永远不重叠，符合"那一刻前台是什么"的直觉。
+    """
+    per_day = defaultdict(list)  # date -> [(start_sec, dur_sec, kind, app)]
+    for rec in records:
+        start = parse_start(rec)
+        if start is None:
+            continue
+        try:
+            dur = int(rec.get("duration_secs") or 0)
+        except (TypeError, ValueError):
+            dur = 0
+        if dur <= 0:
+            continue
+        end = start + timedelta(seconds=dur)
+        kind = rec.get("record_type") or "activity"
+        app = rec.get("app_path") or ""
+        if kind == "activity" and not app:
+            kind = "gap"
+        for s, e in split_midnight(start, end):
+            base = datetime.combine(s.date(), dtime.min)
+            per_day[s.date()].append(((s - base).total_seconds(), (e - s).total_seconds(), kind, app))
+
+    days = []
+    for day in sorted(per_day):
+        items = per_day[day]
+        labels = [None] * 86400
+        lo, hi = 86400, 0
+        for t0, d, kind, app in sorted(items, key=lambda x: x[0]):
+            a = int(round(t0))
+            n = max(1, int(round(d)))
+            a = max(0, min(86399, a))
+            b = min(86400, a + n)
+            for i in range(a, b):
+                labels[i] = (kind, app)
+            lo = min(lo, a)
+            hi = max(hi, b)
+
+        runs = []
+        i = lo
+        while i < hi:
+            if labels[i] is None:
+                i += 1
+                continue
+            j = i
+            while j + 1 < hi and labels[j + 1] == labels[i]:
+                j += 1
+            kind, app = labels[i]
+            label = (kind, app)
+            runs.append({"t": float(i), "d": float(j + 1 - i), "kind": kind, "a": app})
+            i = j + 1
+
+        # 同一应用被 1~3 秒的采样缝隙切开时缝回去
+        merged = []
+        for r in runs:
+            if merged:
+                p = merged[-1]
+                if (p["a"] == r["a"] and p["kind"] == r["kind"]
+                        and r["t"] - (p["t"] + p["d"]) <= MERGE_GAP_SECS):
+                    p["d"] = r["t"] + r["d"] - p["t"]
+                    continue
+            merged.append(r)
+
+        sessions = [{"t": r["t"], "d": r["d"], "a": r["a"]} for r in merged if r["kind"] != "gap"]
+        gaps = [{"t": r["t"], "d": r["d"]} for r in merged if r["kind"] == "gap"]
+
+        totals = defaultdict(float)
+        for s in sessions:
+            totals[s["a"]] += s["d"]
+        app_totals = sorted(totals.items(), key=lambda kv: -kv[1])
+
+        activity = sum(s["d"] for s in sessions)
+        gap_secs = sum(g["d"] for g in gaps)
+        first = merged[0]["t"] if merged else None
+        last = (merged[-1]["t"] + merged[-1]["d"]) if merged else None
+        span = (last - first) if merged else 0.0
+
+        days.append({
+            "date": day.isoformat(),
+            "weekday": "一二三四五六日"[day.weekday()],
+            "sessions": sessions,
+            "gaps": gaps,
+            "app_totals": [[a, round(t)] for a, t in app_totals],
+            "stats": {
+                "records": len(items),
+                "activity": round(activity),
+                "gap": round(gap_secs),
+                "untracked": round(max(0.0, span - activity - gap_secs)),
+                "span": round(span),
+                "offline": round(max(0.0, 86400 - span)),
+                "covered": round(activity + gap_secs),
+                "first": None if first is None else round(first),
+                "last": None if last is None else round(last),
+                "sessions": len(sessions),
+            },
+        })
+    return days
+
+
+def rank_apps(days):
+    totals = defaultdict(float)
+    for d in days:
+        for app, secs in d["app_totals"]:
+            totals[app] += secs
+    return [a for a, _ in sorted(totals.items(), key=lambda kv: -kv[1])]
+
+
+def app_stats(days):
+    """每个应用：总时长、会话数、出现天数、首次与最近一次使用。"""
+    stats = {}
+    for d in days:
+        for s in d["sessions"]:
+            r = stats.get(s["a"])
+            if r is None:
+                r = {"a": s["a"], "total": 0.0, "n": 0, "dates": set(),
+                     "first": [d["date"], s["t"]], "last": [d["date"], s["t"] + s["d"]]}
+                stats[s["a"]] = r
+            r["total"] += s["d"]
+            r["n"] += 1
+            r["dates"].add(d["date"])
+            if (d["date"], s["t"]) < tuple(r["first"]):
+                r["first"] = [d["date"], s["t"]]
+            if (d["date"], s["t"] + s["d"]) > tuple(r["last"]):
+                r["last"] = [d["date"], s["t"] + s["d"]]
+    out = [
+        {"a": r["a"], "total": round(r["total"]), "n": r["n"], "days": len(r["dates"]),
+         "first": r["first"], "last": r["last"]}
+        for r in stats.values()
+    ]
+    out.sort(key=lambda x: -x["total"])
+    return out
+
+
+def build_model(days):
+    apps = rank_apps(days)
+    color_map = {}
+    for i, app in enumerate(apps):
+        color_map[app] = PALETTE[i % len(PALETTE)]
+    labels = {}
+    for app in apps:
+        base = base_name(app)
+        labels[app] = LABELS.get(base, os.path.splitext(base)[0])
+    total = {
+        "activity": sum(d["stats"]["activity"] for d in days),
+        "sessions": sum(d["stats"]["sessions"] for d in days),
+        "apps": len(apps),
+        "days": len(days),
+    }
+    return {
+        "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "days": days,
+        "total": total,
+        "appStats": app_stats(days),
+        "colorMap": color_map,
+        "labels": labels,
+        "palette": PALETTE,
+    }
+
+
+# --------------------------------------------------------------------------
+# HTML
+# --------------------------------------------------------------------------
+HTML_TEMPLATE = r"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+:root{--bg:#f5f6f8;--card:#fff;--ink:#171b24;--muted:#6b7280;--line:#e4e7ec;--accent:#2f6ded;--soft:#eef1f5;--hit:#fff3bf}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth}
+html,body{margin:0;padding:0}
+body{background:var(--bg);color:var(--ink);font:14px/1.55 "Segoe UI","Microsoft YaHei","PingFang SC",system-ui,-apple-system,sans-serif;-webkit-font-smoothing:antialiased}
+.wrap{max-width:1200px;margin:0 auto;padding:22px 20px 48px}
+header.top{display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:14px}
+h1{font-size:20px;margin:0;letter-spacing:.2px;font-weight:650}
+.sub{color:var(--muted);font-size:12.5px;margin-top:4px}
+.sub code{background:var(--soft);padding:1px 5px;border-radius:4px;font-size:11px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px 18px;margin-bottom:14px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.row.between{justify-content:space-between}
+h2{font-size:12px;margin:0 0 10px;color:var(--muted);font-weight:600;letter-spacing:.4px;text-transform:uppercase}
+h3{font-size:15px;margin:0;font-weight:650;letter-spacing:.2px}
+button,.btn{font:inherit;font-size:13px;padding:6px 11px;border-radius:8px;border:1px solid var(--line);background:#fff;color:var(--ink);cursor:pointer;transition:.12s}
+button:hover{background:#f2f4f7}
+input[type=text]{font:inherit;font-size:13px;padding:6px 9px;border-radius:8px;border:1px solid var(--line);background:#fff;width:230px}
+input:focus{outline:2px solid rgba(47,109,237,.22);border-color:var(--accent)}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px}
+.stat .k{font-size:11.5px;color:var(--muted)}
+.stat .v{font-size:21px;font-weight:640;font-variant-numeric:tabular-nums;letter-spacing:-.2px}
+.legend{display:flex;flex-wrap:wrap;gap:7px}
+.lg{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border:1px solid var(--line);border-radius:999px;font-size:12.5px;cursor:pointer;background:#fff;transition:.12s;color:inherit;text-decoration:none}
+.lg:hover{background:#f2f4f7}
+.lg .sw{width:9px;height:9px;border-radius:3px;flex:none}
+.lg .n{font-variant-numeric:tabular-nums;color:var(--muted);font-size:11.5px}
+.lg.active{border-color:var(--ink);box-shadow:0 0 0 1px var(--ink) inset}
+.days-index{display:flex;flex-wrap:wrap;gap:6px}
+.days-index a{font-size:12.5px;padding:3px 9px;border:1px solid var(--line);border-radius:999px;text-decoration:none;color:var(--ink);background:#fff}
+.days-index a:hover{background:#f2f4f7}
+.apptable{margin-top:12px}
+.approw{cursor:pointer}
+.approw:hover td{background:#f8fafc}
+.approw.active td{background:#eef4ff}
+.dayhead{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;cursor:pointer;user-select:none}
+.foldbtn{font-size:12px;padding:4px 10px;border-radius:999px;flex:none}
+.day.collapsed .daytable{display:none}
+.switch{display:inline-flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;color:#344054}
+.switch input{width:15px;height:15px;accent-color:#2f6ded}
+.dayhead .wd{color:var(--muted);font-weight:400;font-size:12.5px;margin-left:6px}
+.daysub{color:var(--muted);font-size:12px;margin-top:3px;font-variant-numeric:tabular-nums}
+.daysub b{color:var(--ink);font-weight:600}
+.daysub .sep{color:#cfd4dc;margin:0 6px}
+.ribbon{position:relative;height:40px;border-radius:8px;background:#eff1f5;overflow:hidden;cursor:crosshair;margin-top:11px;user-select:none}
+.ribbon .seg{position:absolute;top:0;bottom:0;min-width:1px;transition:opacity .1s}
+.ribbon .seg.gap{background:repeating-linear-gradient(45deg,#d5d9e0 0 4px,#e7eaef 4px 8px)}
+.ribbon .seg.dim{opacity:.18}
+.ribbon .cursorline{position:absolute;top:0;bottom:0;width:2px;margin-left:-1px;background:#111;pointer-events:none;display:none;z-index:3}
+.ribbon .cursorline::before{content:"";position:absolute;top:0;left:-4px;border-left:5px solid transparent;border-right:5px solid transparent;border-top:6px solid #111}
+.axis{position:relative;height:16px;margin-top:4px;font-size:10.5px;color:#98a2b3;font-variant-numeric:tabular-nums}
+.axis .tick{position:absolute;top:0;transform:translateX(-50%)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:12px}
+table{width:100%;border-collapse:collapse;font-size:13px;margin-top:12px}
+th{text-align:left;font-weight:600;color:var(--muted);font-size:11.5px;padding:6px 8px;border-bottom:1px solid var(--line);text-transform:uppercase;letter-spacing:.3px}
+td{padding:5px 8px;border-bottom:1px solid #f3f5f8;font-variant-numeric:tabular-nums}
+tbody tr:hover{background:#f8fafc}
+tbody tr.hit{background:var(--hit)!important}
+td.t{color:#475467;width:92px}
+td.app{display:flex;align-items:center;gap:7px}
+td.app .sw{width:9px;height:9px;border-radius:3px;flex:none}
+td.app .exe{color:#b0b7c3;font-size:11.5px;margin-left:2px}
+td.num{text-align:right;color:var(--muted);width:92px}
+.empty{padding:18px;text-align:center;color:var(--muted)}
+.tip{position:fixed;z-index:60;pointer-events:none;background:#171b24;color:#fff;padding:6px 9px;border-radius:7px;font-size:12px;line-height:1.45;box-shadow:0 6px 18px rgba(16,24,40,.22);display:none;white-space:nowrap}
+.tip .t{font-variant-numeric:tabular-nums;opacity:.78}
+.note{font-size:12.5px;color:#4b5563;line-height:1.85}
+.note b{color:var(--ink)}
+.kbd{background:var(--soft);border-radius:4px;padding:0 4px;font-size:11.5px;font-family:Consolas,monospace}
+footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
+@media(max-width:700px){td.app .exe{display:none}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="top">
+    <div>
+      <h1>操作时间线</h1>
+      <div class="sub" id="sub"></div>
+    </div>
+    <div class="row">
+      <input type="text" id="q" placeholder="跳到 14:30 或 2026-10-26 14:30">
+      <button id="go">定位</button>
+      <button id="save" title="把当前这份时间线存成 HTML 文件">保存本页</button>
+    </div>
+  </header>
+
+  <div class="card">
+    <div class="stats" id="stats"></div>
+    <div class="row between" style="margin-top:16px">
+      <h2 style="margin:0">全部应用（点击可只看它）</h2>
+      <span class="hint" id="filterhint" style="color:var(--muted);font-size:12px"></span>
+    </div>
+    <div class="legend" id="legend" style="margin-top:8px"></div>
+    <div class="row" style="margin-top:16px;gap:10px">
+      <h2 style="margin:0">跳到某天</h2>
+      <div class="days-index" id="daysIndex"></div>
+    </div>
+    <div class="row" style="margin-top:16px;gap:12px">
+      <label class="switch"><input type="checkbox" id="fold"> 每天默认收起表格（点日期那一行展开）</label>
+      <button id="expandAll" style="font-size:12px;padding:4px 10px;border-radius:999px">全部展开</button>
+      <button id="collapseAll" style="font-size:12px;padding:4px 10px;border-radius:999px">全部收起</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row between">
+      <h2 style="margin:0">查应用：它是什么时候被用过的</h2>
+      <input type="text" id="appq" placeholder="进程名或名字，如 pallas、微信" style="width:300px">
+    </div>
+    <div id="apphint" style="color:var(--muted);font-size:12px;margin-top:6px"></div>
+    <table class="apptable">
+      <thead><tr>
+        <th>应用</th>
+        <th style="text-align:right;width:110px">总时长</th>
+        <th style="width:90px">出现天数</th>
+        <th style="width:126px">首次使用</th>
+        <th style="width:126px">最近一次</th>
+        <th style="text-align:right;width:76px">段数</th>
+      </tr></thead>
+      <tbody id="apptbody"></tbody>
+    </table>
+    <div class="note" style="margin-top:8px">点一行 = 只看这个应用，并跳到它最近一次使用的那一段（再点取消）。</div>
+  </div>
+
+  <div id="days"></div>
+
+  <div class="card note">
+    <b>怎么读：</b>每段色块是一段会话，鼠标移到色带上可看应用与起止时间；
+    点<b>日期那一行</b>可以展开/收起当天的完整会话表（右上角的开关决定默认是否收起）。<br>
+    灰色斜纹 = 有记录但未归属到应用的空档；空白 = 完全没有记录（关机 / 睡眠 / 记录器未运行）。
+    相邻的同一应用记录（间隔 ≤ 3 秒）已合并成一段。<br>
+    <b>保存：</b>右上角“保存本页”可以把当前这份报告存成独立的 HTML 文件（数据在里面，请自己保管）。
+  </div>
+  <footer>由 <b>时迹 TimeTrace</b> 基于 <span class="kbd">tracker export</span> 生成 · __GEN__ · 数据仍在本地，不上传</footer>
+</div>
+<div class="tip" id="tip"></div>
+<script id="data" type="application/json">__DATA__</script>
+<script>
+(function(){
+"use strict";
+var M = JSON.parse(document.getElementById("data").textContent);
+var DAY = 86400;
+var APPS = Object.keys(M.colorMap);
+var IDX = {};
+for (var ai = 0; ai < APPS.length; ai++) IDX[APPS[ai]] = ai;
+var state = { filter: null, fold: true };
+try { state.fold = localStorage.getItem("rtn.fold") !== "0"; } catch (e) {}
+var $ = function(s){ return document.querySelector(s); };
+
+function pad(n){ n = Math.floor(n); return (n < 10 ? "0" : "") + n; }
+function hms(t){ t = Math.max(0, Math.floor(t)); return pad(t/3600) + ":" + pad((t%3600)/60) + ":" + pad(t%60); }
+function hm(t){ t = Math.max(0, Math.floor(t)); return pad(t/3600) + ":" + pad((t%3600)/60); }
+function durTxt(sec){
+  sec = Math.round(sec);
+  if (sec < 60) return sec + " 秒";
+  var h = Math.floor(sec/3600), m = Math.floor((sec%3600)/60), s = sec%60;
+  if (h) return m ? h + " 小时 " + m + " 分" : h + " 小时";
+  if (s && m < 10) return m + " 分 " + s + " 秒";
+  return m + " 分";
+}
+function esc(s){
+  return String(s == null ? "" : s).replace(/[&<>"']/g, function(c){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c];
+  });
+}
+function colorOf(a){ return M.colorMap[a] || "#98a2b3"; }
+function labelOf(a){ return M.labels[a] || a; }
+function exeOf(a){ return String(a).split(/[\\/]/).pop(); }
+function pct(v){ return (v*100).toFixed(3); }
+
+/* ---------- 顶部概览 ---------- */
+function chipHtml(app, secs, opts){
+  var active = state.filter === app ? " active" : "";
+  return '<span class="lg' + active + '" data-app="' + esc(app) + '"'
+    + (opts && opts.link ? ' data-day="' + esc(opts.link) + '"' : "")
+    + ' title="' + esc(app) + '">'
+    + '<span class="sw" style="background:' + colorOf(app) + '"></span>'
+    + esc(labelOf(app)) + '<span class="n">' + durTxt(secs) + '</span></span>';
+}
+
+function totalAppList(){
+  var tot = {}, order = [];
+  for (var i = 0; i < M.days.length; i++){
+    var at = M.days[i].app_totals;
+    for (var j = 0; j < at.length; j++){
+      var a = at[j][0], v = at[j][1];
+      if (!(a in tot)){ tot[a] = 0; order.push(a); }
+      tot[a] += v;
+    }
+  }
+  order.sort(function(x, y){ return tot[y] - tot[x]; });
+  return order.map(function(a){ return [a, tot[a]]; });
+}
+
+function renderOverview(){
+  var t = M.total;
+  $("#sub").innerHTML = "共 " + M.days.length + " 天 · 总记录 " + durTxt(t.activity)
+    + " · " + M.days[0].date + " ~ " + M.days[M.days.length-1].date
+    + " · 保留期内的全部记录";
+  var items = [
+    ["天数", M.days.length + " 天"],
+    ["总记录时长", durTxt(t.activity)],
+    ["会话数", t.sessions + " 段"],
+    ["应用数", t.apps + " 个"],
+    ["平均每天", durTxt(Math.round(t.activity / Math.max(1, M.days.length)))]
+  ];
+  var h = "";
+  for (var i = 0; i < items.length; i++){
+    h += '<div class="stat"><div class="k">' + items[i][0] + '</div><div class="v">' + items[i][1] + '</div></div>';
+  }
+  $("#stats").innerHTML = h;
+
+  var list = totalAppList();
+  var lg = "";
+  for (var j = 0; j < list.length; j++) lg += chipHtml(list[j][0], list[j][1]);
+  $("#legend").innerHTML = lg;
+
+  var di = "";
+  for (var k = M.days.length - 1; k >= 0; k--){
+    var d = M.days[k];
+    di += '<a href="#d' + d.date + '">' + d.date.slice(5) + " 周" + d.weekday
+        + ' <span style="color:#98a2b3">' + durTxt(d.stats.activity) + "</span></a>";
+  }
+  $("#daysIndex").innerHTML = di;
+}
+
+/* ---------- 查应用 ---------- */
+function shortDT(pair){
+  return pair[0].slice(5) + " " + hms(pair[1]).slice(0, 5);
+}
+function renderAppTable(){
+  var rows = "";
+  for (var i = 0; i < M.appStats.length; i++){
+    var r = M.appStats[i];
+    var hay = (labelOf(r.a) + " " + exeOf(r.a) + " " + r.a).toLowerCase();
+    rows += '<tr class="approw" data-app="' + esc(r.a) + '" data-hay="' + esc(hay) + '">'
+      + '<td class="app"><span class="sw" style="background:' + colorOf(r.a) + '"></span>'
+      + esc(labelOf(r.a)) + '<span class="exe">' + esc(exeOf(r.a)) + '</span></td>'
+      + '<td class="num">' + durTxt(r.total) + '</td>'
+      + '<td>' + r.days + ' 天</td>'
+      + '<td class="t">' + shortDT(r.first) + '</td>'
+      + '<td class="t">' + shortDT(r.last) + '</td>'
+      + '<td class="num">' + r.n + '</td></tr>';
+  }
+  $("#apptbody").innerHTML = rows;
+  updateAppHint(M.appStats.length, "");
+}
+function updateAppHint(n, q){
+  $("#apphint").textContent = q
+    ? ("匹配 " + n + " 个应用")
+    : ("共 " + n + " 个应用，按使用时长排序；输入进程名或名字可以过滤");
+}
+function findAppStat(app){
+  for (var i = 0; i < M.appStats.length; i++) if (M.appStats[i].a === app) return M.appStats[i];
+  return null;
+}
+function onAppRowClick(e){
+  var tr = closestClass(e.target, "approw");
+  if (!tr) return;
+  var app = tr.getAttribute("data-app");
+  var was = state.filter;
+  toggleFilter(app);
+  if (state.filter === app && was !== app){
+    var st = findAppStat(app);
+    if (st && st.last) jump(st.last[0], Math.max(0, st.last[1] - 1), true);
+  }
+}
+
+/* ---------- 每天 ---------- */
+function ribbonHtml(d){
+  var segs = "";
+  var s, i;
+  for (i = 0; i < d.sessions.length; i++){
+    s = d.sessions[i];
+    segs += '<div class="seg" data-a="' + IDX[s.a] + '" style="left:' + pct(s.t/DAY)
+          + '%;width:calc(' + pct(s.d/DAY) + '% + 0.7px);background:' + colorOf(s.a) + '"></div>';
+  }
+  for (i = 0; i < d.gaps.length; i++){
+    s = d.gaps[i];
+    segs += '<div class="seg gap" style="left:' + pct(s.t/DAY) + '%;width:calc(' + pct(s.d/DAY) + '% + 0.7px)"></div>';
+  }
+  return '<div class="ribbon" data-day="' + d.date + '"><div class="segbase" style="position:absolute;inset:0"></div>'
+       + segs + '<div class="cursorline"></div></div>';
+}
+
+function axisHtml(){
+  var h = "";
+  for (var i = 0; i <= 24; i++){
+    h += '<div class="tick" style="left:' + (i/24*100) + '%">' + pad(i) + '</div>';
+  }
+  return '<div class="axis">' + h + '</div>';
+}
+
+function tableHtml(d){
+  if (!d.sessions.length) return '<div class="empty">这一天没有记录</div>';
+  var rows = "";
+  for (var i = 0; i < d.sessions.length; i++){
+    var s = d.sessions[i];
+    rows += '<tr data-a="' + IDX[s.a] + '" data-t="' + s.t + '" data-d="' + s.d + '">'
+      + '<td class="t">' + hms(s.t) + '</td><td class="t">' + hms(s.t + s.d) + '</td>'
+      + '<td class="app" title="' + esc(s.a) + '"><span class="sw" style="background:' + colorOf(s.a) + '"></span>'
+      + esc(labelOf(s.a)) + '<span class="exe">' + esc(exeOf(s.a)) + '</span></td>'
+      + '<td class="num">' + durTxt(s.d) + '</td></tr>';
+  }
+  return '<table><thead><tr><th>开始</th><th>结束</th><th>应用</th><th style="text-align:right">时长</th></tr></thead>'
+       + '<tbody>' + rows + '</tbody></table>';
+}
+
+function dayHtml(d){
+  var st = d.stats;
+  var cover = st.first == null ? "—" : hm(st.first) + " – " + hm(st.last);
+  var sub = '<div class="daysub"><b>' + durTxt(st.activity) + '</b>'
+    + '<span class="sep">·</span>' + st.sessions + ' 段'
+    + '<span class="sep">·</span>覆盖 ' + cover
+    + '<span class="sep">·</span>空档 ' + durTxt(st.gap)
+    + '<span class="sep">·</span>未记录 ' + durTxt(st.untracked)
+    + '</div>';
+
+  var chips = "";
+  for (var i = 0; i < d.app_totals.length; i++) chips += chipHtml(d.app_totals[i][0], d.app_totals[i][1]);
+
+  return '<section class="card day" id="d' + d.date + '">'
+    + '<div class="dayhead">'
+    +   '<div><h3>' + d.date + '<span class="wd">星期' + d.weekday + '</span></h3>' + sub + '</div>'
+    +   '<button class="foldbtn" data-day="' + d.date + '">展开表格</button>'
+    + '</div>'
+    + ribbonHtml(d) + axisHtml()
+    + '<div class="chips">' + chips + '</div>'
+    + '<div class="daytable">' + tableHtml(d) + '</div>'
+    + '</section>';
+}
+
+function renderDays(){
+  var h = "";
+  // 新的日期放前面：打开就先看到今天，往下翻是更早的日子
+  for (var i = M.days.length - 1; i >= 0; i--) h += dayHtml(M.days[i]);
+  $("#days").innerHTML = h;
+  applyFold();
+}
+
+/* ---------- 表格收起 / 展开 ---------- */
+function setSectionFold(secEl, collapsed){
+  if (collapsed) secEl.classList.add("collapsed"); else secEl.classList.remove("collapsed");
+  var b = secEl.querySelector(".foldbtn");
+  if (b) b.textContent = collapsed ? "展开表格" : "收起表格";
+}
+function applyFold(){
+  var secs = document.querySelectorAll("#days section.day");
+  for (var i = 0; i < secs.length; i++) setSectionFold(secs[i], state.fold);
+  var cb = document.getElementById("fold");
+  if (cb) cb.checked = state.fold;
+}
+function setAllFold(collapsed){
+  var secs = document.querySelectorAll("#days section.day");
+  for (var i = 0; i < secs.length; i++) setSectionFold(secs[i], collapsed);
+}
+function toggleDay(secEl){
+  setSectionFold(secEl, !secEl.classList.contains("collapsed"));
+}
+
+/* ---------- 保存本页 ---------- */
+function savePage(){
+  var clone = document.documentElement.cloneNode(true);
+  var wipe = ["days", "apptbody", "legend", "stats", "daysIndex", "sub"];
+  for (var i = 0; i < wipe.length; i++){
+    var node = clone.querySelector("#" + wipe[i]);
+    if (node) node.innerHTML = "";
+  }
+  var tip = clone.querySelector("#tip");
+  if (tip){ tip.style.display = "none"; tip.innerHTML = ""; }
+  var q = clone.querySelector("#q"); if (q) q.setAttribute("value", "");
+  var aq = clone.querySelector("#appq"); if (aq) aq.setAttribute("value", "");
+  var html = "<!DOCTYPE html>\n" + clone.outerHTML;
+  var blob = new Blob([html], { type: "text/html;charset=utf-8" });
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "操作时间线-" + M.days[0].date + "_" + M.days[M.days.length-1].date + ".html";
+  document.body.appendChild(a);
+  a.click();
+  window.setTimeout(function(){
+    URL.revokeObjectURL(a.href);
+    if (a.parentNode) a.parentNode.removeChild(a);
+  }, 800);
+}
+
+/* ---------- 交互 ---------- */
+var tipEl = $("#tip");
+function closestRibbon(node){
+  while (node && node !== document){
+    if (node.classList && node.classList.contains("ribbon")) return node;
+    node = node.parentNode;
+  }
+  return null;
+}
+function sessionAt(d, sec){
+  var lo = 0, hi = d.sessions.length - 1;
+  while (lo <= hi){
+    var mid = (lo + hi) >> 1, s = d.sessions[mid];
+    if (sec < s.t) hi = mid - 1;
+    else if (sec >= s.t + s.d) lo = mid + 1;
+    else return s;
+  }
+  return null;
+}
+function dayOf(dateStr){
+  for (var i = 0; i < M.days.length; i++) if (M.days[i].date === dateStr) return M.days[i];
+  return null;
+}
+function secFromEvent(rib, e){
+  var r = rib.getBoundingClientRect();
+  var f = (e.clientX - r.left) / r.width;
+  if (f < 0) f = 0;
+  if (f > 1) f = 1;
+  return f * DAY;
+}
+function showTip(e, html){
+  tipEl.innerHTML = html;
+  tipEl.style.display = "block";
+  var x = e.clientX + 14, y = e.clientY + 16;
+  if (x + tipEl.offsetWidth > window.innerWidth - 8) x = e.clientX - tipEl.offsetWidth - 12;
+  if (y + tipEl.offsetHeight > window.innerHeight - 8) y = e.clientY - tipEl.offsetHeight - 12;
+  tipEl.style.left = x + "px";
+  tipEl.style.top = y + "px";
+}
+function hideTip(){ tipEl.style.display = "none"; }
+
+function onMove(e){
+  var rib = closestRibbon(e.target);
+  if (!rib){ hideTip(); return; }
+  var d = dayOf(rib.getAttribute("data-day"));
+  var sec = secFromEvent(rib, e);
+  var s = d ? sessionAt(d, sec) : null;
+  var html;
+  if (s){
+    html = "<b>" + esc(labelOf(s.a)) + "</b><br><span class='t'>"
+         + hms(s.t) + " – " + hms(s.t + s.d) + " · " + durTxt(s.d) + "</span>";
+  } else {
+    html = "<span class='t'>" + hms(sec) + " · 这个时刻没有记录</span>";
+  }
+  showTip(e, html);
+}
+
+function markCursor(rib, sec){
+  var cl = rib.querySelector(".cursorline");
+  cl.style.display = "block";
+  cl.style.left = (sec/DAY*100) + "%";
+}
+function highlightRow(secEl, sec){
+  var rows = secEl.querySelectorAll("tbody tr");
+  var best = null;
+  for (var i = 0; i < rows.length; i++){
+    var t = parseFloat(rows[i].getAttribute("data-t"));
+    var dd = parseFloat(rows[i].getAttribute("data-d"));
+    if (sec >= t && sec < t + dd){ best = rows[i]; break; }
+  }
+  var old = document.querySelectorAll("tr.hit");
+  for (var k = 0; k < old.length; k++) old[k].className = old[k].className.replace(/\s*hit/g, "");
+  if (best) best.className += " hit";
+  return best;
+}
+
+function closestClass(node, cls){
+  while (node && node !== document){
+    if (node.classList && node.classList.contains(cls)) return node;
+    node = node.parentNode;
+  }
+  return null;
+}
+
+function toggleFilter(app){
+  state.filter = (state.filter === app) ? null : app;
+  applyFilter();
+}
+
+function onClick(e){
+  var lg = closestClass(e.target, "lg");
+  if (lg && lg.getAttribute("data-app")){ toggleFilter(lg.getAttribute("data-app")); return; }
+  var head = closestClass(e.target, "dayhead");
+  if (head){
+    var sec = closestClass(head, "day");
+    if (sec){ toggleDay(sec); return; }
+  }
+  var rib = closestRibbon(e.target);
+  if (!rib) return;
+  var sec2 = secFromEvent(rib, e);
+  markCursor(rib, sec2);
+  var secEl = document.getElementById("d" + rib.getAttribute("data-day"));
+  if (secEl) highlightRow(secEl, sec2);
+}
+
+function applyFilter(){
+  var idx = state.filter == null ? -1 : IDX[state.filter];
+  var i;
+  var segs = document.querySelectorAll("#days .seg[data-a]");
+  for (i = 0; i < segs.length; i++){
+    var on = idx < 0 || parseInt(segs[i].getAttribute("data-a"), 10) === idx;
+    if (on) segs[i].classList.remove("dim"); else segs[i].classList.add("dim");
+  }
+  var rows = document.querySelectorAll("#days tbody tr");
+  var perDay = {};
+  for (i = 0; i < rows.length; i++){
+    var showRow = idx < 0 || parseInt(rows[i].getAttribute("data-a"), 10) === idx;
+    rows[i].style.display = showRow ? "" : "none";
+    if (showRow){
+      var sec = closestClass(rows[i], "day");
+      if (sec) perDay[sec.id] = (perDay[sec.id] || 0) + 1;
+    }
+  }
+  // 只看某个应用时，把那天完全没用到它的卡片也收起来
+  var sections = document.querySelectorAll("#days section.day");
+  for (i = 0; i < sections.length; i++){
+    sections[i].style.display = (idx < 0 || perDay[sections[i].id]) ? "" : "none";
+  }
+  var chips = document.querySelectorAll(".lg[data-app]");
+  for (i = 0; i < chips.length; i++){
+    var active = state.filter != null && chips[i].getAttribute("data-app") === state.filter;
+    if (active) chips[i].classList.add("active"); else chips[i].classList.remove("active");
+  }
+  var appRows = document.querySelectorAll("#apptbody tr");
+  for (i = 0; i < appRows.length; i++){
+    var act = state.filter != null && appRows[i].getAttribute("data-app") === state.filter;
+    if (act) appRows[i].classList.add("active"); else appRows[i].classList.remove("active");
+  }
+  if (state.filter == null){
+    $("#filterhint").textContent = "";
+  } else {
+    var st = findAppStat(state.filter);
+    $("#filterhint").textContent = "只看 " + labelOf(state.filter)
+      + (st ? "（" + st.days + " 天 · 共 " + durTxt(st.total) + "）" : "")
+      + " · 再点一次取消";
+  }
+}
+
+/* ---------- 时间定位 ---------- */
+function parseQuery(q){
+  q = (q || "").trim();
+  var m = q.match(/^(?:(\d{4})[-/.](\d{1,2})[-/.](\d{1,2}))?\s*(\d{1,2})[:：时点]?\s*(\d{1,2})?(?:[:：分]\s*(\d{1,2}))?/);
+  if (!m) return null;
+  var dateStr = null;
+  if (m[1]) dateStr = m[1] + "-" + pad(m[2]) + "-" + pad(m[3]);
+  var hh = parseInt(m[4], 10);
+  var mm = m[5] != null ? parseInt(m[5], 10) : 0;
+  var ss = m[6] != null ? parseInt(m[6], 10) : 0;
+  if (isNaN(hh) || hh > 23 || mm > 59) return null;
+  return { date: dateStr, sec: hh*3600 + mm*60 + ss };
+}
+
+function jump(dayStr, sec, smooth){
+  var secEl = document.getElementById("d" + dayStr);
+  if (!secEl) return false;
+  var rib = secEl.querySelector(".ribbon");
+  markCursor(rib, sec);
+  var row = highlightRow(secEl, sec);
+  var target = row || secEl;
+  if (target.scrollIntoView) target.scrollIntoView({ behavior: smooth ? "smooth" : "auto", block: "center" });
+  return true;
+}
+
+$("#go").addEventListener("click", function(){
+  var p = parseQuery($("#q").value);
+  if (!p){ alert("看不懂这个时间，试试 14:30 或 2026-10-26 14:30"); return; }
+  if (p.date){
+    if (!jump(p.date, p.sec, true)) alert("没有 " + p.date + " 的数据");
+    return;
+  }
+  // 没写日期：从最近一天往前找，定位到第一处有记录（或最近）的那天
+  for (var i = M.days.length - 1; i >= 0; i--){
+    var d = M.days[i];
+    if (sessionAt(d, p.sec)){ jump(d.date, p.sec, true); return; }
+  }
+  jump(M.days[M.days.length-1].date, p.sec, true);
+});
+$("#q").addEventListener("keydown", function(e){ if (e.key === "Enter") $("#go").click(); });
+
+document.getElementById("days").addEventListener("mousemove", onMove);
+document.getElementById("days").addEventListener("mouseleave", hideTip);
+document.getElementById("days").addEventListener("click", onClick);
+document.getElementById("legend").addEventListener("click", onClick);
+document.getElementById("apptbody").addEventListener("click", onAppRowClick);
+document.getElementById("fold").addEventListener("change", function(){
+  state.fold = this.checked;
+  try { localStorage.setItem("rtn.fold", state.fold ? "1" : "0"); } catch (e) {}
+  applyFold();
+});
+document.getElementById("expandAll").addEventListener("click", function(){ setAllFold(false); });
+document.getElementById("collapseAll").addEventListener("click", function(){ setAllFold(true); });
+document.getElementById("save").addEventListener("click", savePage);
+document.getElementById("appq").addEventListener("input", function(){
+  var q = this.value.trim().toLowerCase();
+  var rows = document.querySelectorAll("#apptbody tr");
+  var shown = 0;
+  for (var i = 0; i < rows.length; i++){
+    var ok = !q || rows[i].getAttribute("data-hay").indexOf(q) >= 0;
+    rows[i].style.display = ok ? "" : "none";
+    if (ok) shown++;
+  }
+  updateAppHint(shown, q);
+});
+
+renderOverview();
+renderAppTable();
+renderDays();
+})();
+</script>
+</body>
+</html>
+"""
+
+def render_html(model, title=APP_TITLE):
+    data = json.dumps(model, ensure_ascii=False, separators=(",", ":"))
+    data = data.replace("</", "<\\/")
+    return (
+        HTML_TEMPLATE
+        .replace("__TITLE__", title)
+        .replace("__GEN__", model["generated"])
+        .replace("__DATA__", data)
+    )
+
+
+# --------------------------------------------------------------------------
+# 文本输出
+# --------------------------------------------------------------------------
+def hms_local(sec):
+    sec = max(0, int(sec))
+    return "%02d:%02d:%02d" % (sec // 3600, (sec % 3600) // 60, sec % 60)
+
+
+def disp_width(text):
+    """中文按 2 列算，用来对齐终端里的表格。"""
+    return sum(2 if unicodedata.east_asian_width(ch) in "WF" else 1 for ch in text)
+
+
+def pad_disp(text, width):
+    return text + " " * max(0, width - disp_width(text))
+
+
+def dur_local(seconds):
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return "%d 秒" % seconds
+    h, m, s = seconds // 3600, (seconds % 3600) // 60, seconds % 60
+    if h:
+        return "%d 小时 %d 分" % (h, m) if m else "%d 小时" % h
+    if s and m < 10:
+        return "%d 分 %d 秒" % (m, s)
+    return "%d 分" % m
+
+
+def label_for(model, app):
+    return model["labels"].get(app, base_name(app))
+
+
+def find_day(model, date_str):
+    for d in model["days"]:
+        if d["date"] == date_str:
+            return d
+    return None
+
+
+def print_day(model, date_str):
+    d = find_day(model, date_str)
+    if d is None:
+        print("没有 %s 的记录。可用日期：%s" % (date_str, "、".join(x["date"] for x in model["days"])))
+        return
+    st = d["stats"]
+    print()
+    print("=" * 72)
+    print(" %s 星期%s · 记录 %s · %d 段会话" % (d["date"], d["weekday"], dur_local(st["activity"]), st["sessions"]))
+    if st["first"] is not None:
+        print(" 覆盖时段 %s – %s · 空档 %s · 无记录 %s"
+              % (hms_local(st["first"]), hms_local(st["last"]),
+                 dur_local(st["gap"]), dur_local(st["untracked"])))
+    print("=" * 72)
+
+    timeline = [(s["t"], s["t"] + s["d"], s["a"], "act") for s in d["sessions"]]
+    timeline += [(g["t"], g["t"] + g["d"], "", "gap") for g in d["gaps"]]
+    timeline.sort()
+    prev_end = None
+    for t, e, app, kind in timeline:
+        if prev_end is not None and t - prev_end >= 60:
+            print("        ...   （这段没有记录，%s）" % dur_local(t - prev_end))
+        if kind == "gap":
+            print("%s - %s  %s%s" % (hms_local(t), hms_local(e),
+                                     pad_disp(dur_local(e - t), 12), "（空档）"))
+        else:
+            print("%s - %s  %s%s" % (hms_local(t), hms_local(e),
+                                     pad_disp(dur_local(e - t), 12), label_for(model, app)))
+        prev_end = e if prev_end is None else max(prev_end, e)
+
+    print("-" * 72)
+    print(" 按应用合计")
+    for app, secs in d["app_totals"]:
+        print("   %s%s" % (pad_disp(label_for(model, app), 30), dur_local(secs)))
+    print()
+
+
+def print_at(model, date_str, sec, context_min=10):
+    d = find_day(model, date_str)
+    if d is None:
+        print("没有 %s 的记录。可用日期：%s" % (date_str, "、".join(x["date"] for x in model["days"])))
+        return
+    print()
+    print("=" * 72)
+    print(" %s %s 这一时刻" % (d["date"], hms_local(sec)))
+    print("=" * 72)
+
+    hit = [s for s in d["sessions"] if s["t"] <= sec < s["t"] + s["d"]]
+    gap = [g for g in d["gaps"] if g["t"] <= sec < g["t"] + g["d"]]
+    if hit:
+        s = hit[0]
+        idx = d["sessions"].index(s) + 1
+        print(" 正在使用：%s" % label_for(model, s["a"]))
+        print(" 进程路径：%s" % s["a"])
+        print(" 本段会话：%s → %s（共 %s，该时刻已进行 %s，第 %d 段）"
+              % (hms_local(s["t"]), hms_local(s["t"] + s["d"]), dur_local(s["d"]),
+                 dur_local(sec - s["t"]), idx))
+    elif gap:
+        g = gap[0]
+        print(" 这一时刻属于空档（有记录但未归属到应用）：%s → %s（%s）"
+              % (hms_local(g["t"]), hms_local(g["t"] + g["d"]), dur_local(g["d"])))
+    else:
+        print(" 这一时刻没有任何记录（离开电脑 / 关机 / 记录器未运行）")
+        before = [s for s in d["sessions"] if s["t"] + s["d"] <= sec]
+        after = [s for s in d["sessions"] if s["t"] > sec]
+        if before:
+            b = before[-1]
+            print(" 上一段：%s %s → %s" % (label_for(model, b["a"]), hms_local(b["t"]), hms_local(b["t"] + b["d"])))
+        if after:
+            a = after[0]
+            print(" 下一段：%s 从 %s 开始" % (label_for(model, a["a"]), hms_local(a["t"])))
+
+    lo = max(0, sec - context_min * 60)
+    hi = min(86400, sec + context_min * 60)
+    print()
+    print(" 前后 %d 分钟（%s – %s）出现过：" % (context_min, hms_local(lo), hms_local(hi)))
+    totals = {}
+    for s in d["sessions"]:
+        overlap = min(s["t"] + s["d"], hi) - max(s["t"], lo)
+        if overlap > 0:
+            totals[s["a"]] = totals.get(s["a"], 0) + overlap
+    for app, secs in sorted(totals.items(), key=lambda kv: -kv[1]):
+        print("   %s%s" % (pad_disp(label_for(model, app), 30), dur_local(secs)))
+    if not totals:
+        print("   （这段时间没有任何记录）")
+
+    near = [s for s in d["sessions"] if s["t"] < hi and s["t"] + s["d"] > lo]
+    if near:
+        print()
+        print(" 这段区间里的会话：")
+        for s in near:
+            mark = " ←" if s in hit else ""
+            print("   %s - %s  %s%s%s" % (hms_local(s["t"]), hms_local(s["t"] + s["d"]),
+                                          pad_disp(dur_local(s["d"]), 12),
+                                          label_for(model, s["a"]), mark))
+    print()
+
+
+# --------------------------------------------------------------------------
+# 命令
+# --------------------------------------------------------------------------
+def parse_time_text(text, default_date):
+    """支持 '14:30'、'1430'、'2026-10-26 14:30'、'14:30:15'。"""
+    text = text.strip()
+    m = re.match(
+        r"^(?:(\d{4})[-/.](\d{1,2})[-/.](\d{1,2}))?\s*"
+        r"(\d{1,2})[:：时点]?\s*(\d{1,2})?(?:[:：分]\s*(\d{1,2}))?",
+        text,
+    )
+    if not m:
+        return None
+    ds = None
+    if m.group(1):
+        ds = "%s-%02d-%02d" % (m.group(1), int(m.group(2)), int(m.group(3)))
+    hh = int(m.group(4))
+    mm = int(m.group(5)) if m.group(5) is not None else 0
+    ss = int(m.group(6)) if m.group(6) is not None else 0
+    if hh > 23 or mm > 59 or ss > 59:
+        return None
+    return (ds or default_date), hh * 3600 + mm * 60 + ss
+
+
+def all_log_days():
+    """直接从数据目录的文件名（YYYY-MM-DD.log）找出有记录的日期，不必先导出。"""
+    root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustTimeNoter", "data")
+    out = []
+    for dirpath, _dirnames, files in os.walk(root):
+        for name in files:
+            m = re.match(r"^(\d{4}-\d{2}-\d{2})\.log$", name)
+            if m:
+                try:
+                    out.append(datetime.strptime(m.group(1), "%Y-%m-%d").date())
+                except ValueError:
+                    pass
+    return sorted(set(out))
+
+
+def prune_logs(days=RETENTION_DAYS, dry_run=False):
+    """删除早于保留期的日志分片；只动 YYYY-MM-DD.log，别的文件一律不碰。"""
+    root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustTimeNoter", "data")
+    cutoff = date.today() - timedelta(days=max(1, days) - 1)
+    removed, kept, freed = [], 0, 0
+    if not os.path.isdir(root):
+        return cutoff, removed, kept, freed
+    for dirpath, _dirnames, files in os.walk(root):
+        for name in files:
+            m = re.match(r"^(\d{4}-\d{2}-\d{2})\.log$", name)
+            if not m:
+                continue
+            try:
+                d = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            path = os.path.join(dirpath, name)
+            if d < cutoff:
+                try:
+                    size = os.path.getsize(path)
+                    if not dry_run:
+                        os.remove(path)
+                except OSError:
+                    continue
+                removed.append((d, path, size))
+                freed += size
+            else:
+                kept += 1
+    # 顺手收掉删空的 YYYY / MM 目录
+    if not dry_run:
+        for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+            if dirpath == root or filenames or dirnames:
+                continue
+            if re.search(r"[\\/](\d{4}|\d{2})$", dirpath):
+                try:
+                    os.rmdir(dirpath)
+                except OSError:
+                    pass
+    return cutoff, removed, kept, freed
+
+
+def auto_prune(args):
+    """除了显式 --no-prune，每次用到数据前都清一次过期分片。"""
+    if getattr(args, "no_prune", False):
+        return
+    days = getattr(args, "retention", RETENTION_DAYS) or RETENTION_DAYS
+    _cutoff, removed, _kept, freed = prune_logs(days)
+    if removed:
+        print("已清理 %d 个超过 %d 天的日志分片（释放 %.0f KB）" % (len(removed), days, freed / 1024.0))
+
+
+def resolve_range(args, default_days=None):
+    """有 --days/--from/--to 就按它；否则用数据目录里保留期内的日子。"""
+    if args.days or args.from_day or args.to_day:
+        return range_from_args(args)
+    days = default_days or getattr(args, "retention", RETENTION_DAYS) or RETENTION_DAYS
+    logs = all_log_days()
+    t = logs[-1] if logs else date.today()
+    f = logs[0] if logs else t - timedelta(days=days - 1)
+    floor = t - timedelta(days=days - 1)
+    if f < floor:
+        f = floor
+    return f, t
+
+
+def range_from_args(args, default_days=7):
+    days = args.days or default_days
+    if args.from_day or args.to_day:
+        f = datetime.strptime(args.from_day, "%Y-%m-%d").date() if args.from_day else None
+        t = datetime.strptime(args.to_day, "%Y-%m-%d").date() if args.to_day else None
+        if f is None:
+            f = t - timedelta(days=days - 1)
+        if t is None:
+            t = date.today()
+        if f > t:
+            f, t = t, f
+        return f, t
+    t = date.today()
+    return t - timedelta(days=days - 1), t
+
+
+def resolve_range(args):
+    """有 --days/--from/--to 就按它；否则用数据目录里所有有记录的日子。"""
+    if args.days or args.from_day or args.to_day:
+        return range_from_args(args)
+    logs = all_log_days()
+    t = logs[-1] if logs else date.today()
+    f = logs[0] if logs else t - timedelta(days=6)
+    if (t - f).days > 366:
+        f = t - timedelta(days=366)
+        print("记录超过 366 天，只查最近 366 天。要查更早的请用 --from / --to。")
+    return f, t
+
+
+def cmd_prune(args):
+    cutoff, removed, kept, freed = prune_logs(args.days, args.dry_run)
+    print()
+    if args.dry_run:
+        print("（演练模式：只列出会删什么，没有真的删除）")
+    print("保留最近 %d 天（%s 及以后），当前保留 %d 个分片" % (args.days, cutoff.isoformat(), kept))
+    if removed:
+        print("%s %d 个过期分片（%.1f KB）：" % ("将删除" if args.dry_run else "已删除",
+                                              len(removed), freed / 1024.0))
+        for d, path, size in removed[:40]:
+            print("  %s  %.1f KB  %s" % (d.isoformat(), size / 1024.0, path))
+        if len(removed) > 40:
+            print("  …还有 %d 个" % (len(removed) - 40))
+    else:
+        print("没有需要删除的过期分片。")
+    print()
+
+
+def cmd_html(args):
+    auto_prune(args)
+    f, t = resolve_range(args)
+    records = export_records(f, t)
+    days = build_days(records)
+    if not days:
+        sys.exit("这段时间（%s 至 %s）没有任何记录。" % (f, t))
+    model = build_model(days)
+    html = render_html(model)
+
+    out = args.out
+    if not out:
+        out = os.path.join(tempfile.gettempdir(), "时迹_时间线.html")
+    out = os.path.abspath(out)
+    with open(out, "w", encoding="utf-8") as fp:
+        fp.write(html)
+
+    print("时间线已生成：%s" % out)
+    print("覆盖 %s 至 %s，共 %d 天、%d 条会话。"
+          % (days[0]["date"], days[-1]["date"], len(days),
+             sum(d["stats"]["sessions"] for d in days)))
+    if not args.no_open:
+        try:
+            os.startfile(out)  # noqa: S606  (Windows)
+        except (AttributeError, OSError):
+            import webbrowser
+            webbrowser.open("file:///" + out.replace("\\", "/"))
+
+
+def cmd_day(args):
+    auto_prune(args)
+    if args.date and not (args.days or args.from_day or args.to_day):
+        f = t = datetime.strptime(args.date, "%Y-%m-%d").date()
+    else:
+        f, t = range_from_args(args)
+    records = export_records(f, t)
+    days = build_days(records)
+    if not days:
+        sys.exit("这段时间没有任何记录。")
+    model = build_model(days)
+    target = args.date or days[-1]["date"]
+    print_day(model, target)
+
+
+def app_match(stats, query):
+    q = query.strip().lower()
+    hits = []
+    for r in stats:
+        app = r["a"]
+        base = base_name(app)
+        hay = " ".join([app, base, LABELS.get(base, ""), os.path.splitext(base)[0]]).lower()
+        if q in hay:
+            hits.append(r)
+    return hits
+
+
+def print_app_report(model, hits, gap_secs=300, max_hits=8):
+    for r in hits[:max_hits]:
+        app = r["a"]
+        print()
+        print("◆ %s  (%s)" % (label_for(model, app), base_name(app)))
+        print("   路径    %s" % app)
+        print("   总时长  %s · %d 段 · 出现 %d 天" % (dur_local(r["total"]), r["n"], r["days"]))
+        print("   首次    %s %s" % (r["first"][0], hms_local(r["first"][1])))
+        print("   最近    %s %s" % (r["last"][0], hms_local(r["last"][1])))
+        for d in model["days"]:
+            ss = [s for s in d["sessions"] if s["a"] == app]
+            if not ss:
+                continue
+            spans = []
+            for s in ss:
+                if spans and s["t"] - spans[-1]["e"] <= gap_secs:
+                    spans[-1]["e"] = max(spans[-1]["e"], s["t"] + s["d"])
+                    spans[-1]["n"] += 1
+                else:
+                    spans.append({"s": s["t"], "e": s["t"] + s["d"], "n": 1})
+            pieces = []
+            for i, x in enumerate(spans):
+                if i == 8:
+                    pieces.append("…还有 %d 段" % (len(spans) - 8))
+                    break
+                pieces.append("%s–%s" % (hms_local(x["s"])[:5], hms_local(x["e"])[:5]))
+            day_total = sum(s["d"] for s in ss)
+            print("   %s  共 %s · %s" % (d["date"], dur_local(day_total), "  ".join(pieces)))
+    if len(hits) > max_hits:
+        print()
+        print("（还有 %d 个匹配的应用没列出，查得更精确一些吧）" % (len(hits) - max_hits))
+
+
+def cmd_app(args):
+    query = args.name
+    auto_prune(args)
+    if not query:
+        print("输入应用名或进程名的一部分（如 pallas、微信、WeGame），直接回车退出。")
+        try:
+            query = input("应用名：").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not query:
+            return
+    f, t = resolve_range(args)
+    records = export_records(f, t)
+    days = build_days(records)
+    if not days:
+        sys.exit("这段时间没有任何记录。")
+    model = build_model(days)
+    hits = app_match(model["appStats"], query)
+    if not hits:
+        names = "、".join(label_for(model, r["a"]) for r in model["appStats"][:15])
+        sys.exit("没有找到包含“%s”的应用。\n有记录的应用包括：%s" % (query, names))
+    print()
+    print("=" * 72)
+    print(" “%s” 匹配到 %d 个应用 · 数据范围 %s 至 %s" % (query, len(hits), days[0]["date"], days[-1]["date"]))
+    print("=" * 72)
+    print_app_report(model, hits, args.gap)
+    print()
+
+
+def cmd_at(args):
+    auto_prune(args)
+    today = date.today().isoformat()
+    text = args.time
+    if not text:
+        print("输入想看的时间（如 14:30 或 2026-10-26 14:30），直接回车退出。")
+        try:
+            text = input("时间：").strip()
+        except (EOFError, KeyboardInterrupt):
+            return
+        if not text:
+            return
+    parsed = parse_time_text(text, today)
+    if parsed is None:
+        sys.exit("看不懂“%s”，示例：14:30 、2026-10-26 14:30" % text)
+    day_str, sec = parsed
+
+    f = datetime.strptime(day_str, "%Y-%m-%d").date()
+    records = export_records(f, f)
+    days = build_days(records)
+    if not days:
+        sys.exit("%s 没有记录（那天可能没开机）。双击 时间线.bat 可以看到哪几天有数据。" % day_str)
+    model = build_model(days)
+    if find_day(model, day_str) is None:
+        sys.exit("%s 没有记录。可查的最近日期：%s" % (day_str, days[-1]["date"]))
+    print_at(model, day_str, sec, args.context)
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="TimeTrace",
+        description="时迹 TimeTrace — RustTimeNoter 的时间线查看器",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "示例：\n"
+            "  TimeTrace.exe html\n"
+            "  TimeTrace.exe at \"14:30\"\n"
+            "  TimeTrace.exe app pallas\n"
+            "  TimeTrace.exe day --date 2026-10-26\n"
+            "  TimeTrace.exe prune --dry-run\n"
+        ),
+    )
+    p.add_argument("--version", action="version",
+                   version="%(prog)s " + VERSION + "  (RustTimeNoter 时间线查看器)")
+    sub = p.add_subparsers(dest="cmd")
+
+    def add_range(sp, default_days=None):
+        sp.add_argument("--days", type=int, default=default_days,
+                        help="只看最近 N 天（默认：保留期内的全部日子）")
+        sp.add_argument("--from", dest="from_day", help="起始日期 YYYY-MM-DD")
+        sp.add_argument("--to", dest="to_day", help="截止日期 YYYY-MM-DD")
+        sp.add_argument("--retention", type=int, default=RETENTION_DAYS,
+                        help="日志保留天数（默认 30，超期分片会被自动删除）")
+        sp.add_argument("--no-prune", action="store_true", help="这次不要清理过期日志")
+
+    h = sub.add_parser("html", help="生成“打开即全部展开”的时间线并打开浏览器")
+    add_range(h)
+    h.add_argument("--out", help="输出 HTML 路径")
+    h.add_argument("--no-open", action="store_true", help="只生成文件，不打开浏览器")
+    h.set_defaults(func=cmd_html)
+
+    d = sub.add_parser("day", help="控制台打印某天的时间流水")
+    add_range(d, default_days=7)
+    d.add_argument("--date", help="指定日期 YYYY-MM-DD（默认最近一天）")
+    d.set_defaults(func=cmd_day)
+
+    a = sub.add_parser("at", help="查询某一时刻在用什么")
+    a.add_argument("time", nargs="?", help="如 14:30 或 2026-10-26 14:30；省略则交互输入")
+    a.add_argument("--context", type=int, default=10, help="前后参照分钟数（默认 10）")
+    a.add_argument("--retention", type=int, default=RETENTION_DAYS, help="日志保留天数（默认 30）")
+    a.add_argument("--no-prune", action="store_true", help="这次不要清理过期日志")
+    a.set_defaults(func=cmd_at)
+
+    ap = sub.add_parser("app", help="查某个应用是什么时候被用过的")
+    ap.add_argument("name", nargs="?", help="应用名或进程名的一部分，如 pallas、微信；省略则交互输入")
+    add_range(ap)
+    ap.add_argument("--gap", type=int, default=300, help="间隔多少秒内的使用合并成一个时段（默认 300）")
+    ap.set_defaults(func=cmd_app)
+
+    pr = sub.add_parser("prune", help="删除超过保留期的日志分片（默认 30 天）")
+    pr.add_argument("--days", type=int, default=RETENTION_DAYS, help="保留天数（默认 30）")
+    pr.add_argument("--dry-run", action="store_true", help="只列出会删什么，不真的删除")
+    pr.set_defaults(func=cmd_prune)
+
+    return p
+
+
+def setup_console():
+    """双击 exe 时控制台默认是 GBK，切到 UTF-8 才不会乱码。"""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.SetConsoleOutputCP(65001)
+        k32.SetConsoleCP(65001)
+    except Exception:
+        pass
+
+
+def main():
+    setup_console()
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+    parser = build_parser()
+    args = parser.parse_args()
+    if not getattr(args, "cmd", None):
+        parser.print_help()
+        return
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        try:
+            sys.stdout.close()
+        except OSError:
+            pass
+    except KeyboardInterrupt:
+        print()
+
+
+if __name__ == "__main__":
+    main()
