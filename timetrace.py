@@ -18,6 +18,8 @@ RustTimeNoter 自带的报表只给"某个应用共用了多久"，看不出"几
 """
 
 import argparse
+import base64
+import hashlib
 import json
 import os
 import re
@@ -31,7 +33,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "1.0.1"
+VERSION = "1.1.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -112,6 +114,88 @@ def find_tracker():
         "或者把 tracker.exe 放到本程序同一个文件夹里。\n"
         "默认查找位置：%LOCALAPPDATA%\\RustTimeNoter\\bin\\tracker.exe"
     )
+
+
+# --------------------------------------------------------------------------
+# 应用图标：从 exe 里取图标，缓存成本地 PNG，页面里用 base64 内嵌
+# --------------------------------------------------------------------------
+ICON_CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "icons")
+
+_PS_ICON_TEMPLATE = r'''
+Add-Type -AssemblyName System.Drawing
+$map = Get-Content -Raw -Encoding UTF8 '%s' | ConvertFrom-Json
+foreach ($prop in $map.PSObject.Properties) {
+    $src = $prop.Name
+    $dst = $prop.Value
+    try {
+        if (-not (Test-Path -LiteralPath $src)) { continue }
+        $ico = [System.Drawing.Icon]::ExtractAssociatedIcon($src)
+        if ($null -eq $ico) { continue }
+        $bmp = $ico.ToBitmap()
+        $bmp.Save($dst, [System.Drawing.Imaging.ImageFormat]::Png)
+        $bmp.Dispose()
+        $ico.Dispose()
+    } catch { }
+}
+'''
+
+
+def _icon_cache_file(app_path):
+    """按 路径+大小+修改时间 缓存，程序升级后图标会自动刷新。"""
+    try:
+        st = os.stat(app_path)
+        key = "%s|%d|%d" % (app_path.lower(), st.st_size, int(st.st_mtime))
+    except OSError:
+        key = app_path.lower()
+    name = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16] + ".png"
+    return os.path.join(ICON_CACHE_DIR, name)
+
+
+def load_icons(apps):
+    """返回 {exe 路径: data:image/png;base64,...}；取不到的应用直接跳过（页面回退到色块）。"""
+    if os.name != "nt":
+        return {}
+    usable = [a for a in apps if a and os.path.isfile(a)]
+    cached, todo = {}, []
+    for a in usable:
+        p = _icon_cache_file(a)
+        if os.path.isfile(p) and os.path.getsize(p) > 0:
+            cached[a] = p
+        else:
+            todo.append(a)
+
+    if todo:
+        try:
+            os.makedirs(ICON_CACHE_DIR, exist_ok=True)
+            tmp = tempfile.mkdtemp(prefix="tt_icon_")
+            listing = dict((a, _icon_cache_file(a)) for a in todo)
+            list_file = os.path.join(tmp, "list.json")
+            with open(list_file, "w", encoding="utf-8") as fp:
+                json.dump(listing, fp, ensure_ascii=False)
+            script = _PS_ICON_TEMPLATE % (list_file.replace("'", "''"),)
+            encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+                capture_output=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                timeout=90,
+            )
+            for a in todo:
+                p = listing[a]
+                if os.path.isfile(p) and os.path.getsize(p) > 0:
+                    cached[a] = p
+            shutil.rmtree(tmp, ignore_errors=True)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    out = {}
+    for a, p in cached.items():
+        try:
+            with open(p, "rb") as fp:
+                out[a] = "data:image/png;base64," + base64.b64encode(fp.read()).decode("ascii")
+        except OSError:
+            continue
+    return out
 
 
 def export_records(from_day, to_day):
@@ -305,7 +389,7 @@ def app_stats(days):
     return out
 
 
-def build_model(days):
+def build_model(days, with_icons=False):
     apps = rank_apps(days)
     color_map = {}
     for i, app in enumerate(apps):
@@ -320,7 +404,7 @@ def build_model(days):
         "apps": len(apps),
         "days": len(days),
     }
-    return {
+    model = {
         "generated": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "days": days,
         "total": total,
@@ -329,6 +413,9 @@ def build_model(days):
         "labels": labels,
         "palette": PALETTE,
     }
+    if with_icons:
+        model["icons"] = load_icons(apps)
+    return model
 
 
 # --------------------------------------------------------------------------
@@ -368,6 +455,9 @@ input:focus{outline:2px solid rgba(47,109,237,.22);border-color:var(--accent)}
 .lg{display:inline-flex;align-items:center;gap:6px;padding:3px 9px;border:1px solid var(--line);border-radius:999px;font-size:12.5px;cursor:pointer;background:#fff;transition:.12s;color:inherit;text-decoration:none}
 .lg:hover{background:#f2f4f7}
 .lg .sw{width:9px;height:9px;border-radius:3px;flex:none}
+.ico{width:15px;height:15px;flex:none;border-radius:3px;vertical-align:-3px}
+.lg .ico{width:14px;height:14px}
+.segico{position:absolute;top:50%;transform:translateY(-50%);width:10px;height:10px;pointer-events:none;z-index:2;filter:drop-shadow(0 0 1px rgba(255,255,255,.95))}
 .lg .n{font-variant-numeric:tabular-nums;color:var(--muted);font-size:11.5px}
 .lg.active{border-color:var(--ink);box-shadow:0 0 0 1px var(--ink) inset}
 .days-index{display:flex;flex-wrap:wrap;gap:6px}
@@ -380,6 +470,13 @@ input:focus{outline:2px solid rgba(47,109,237,.22);border-color:var(--accent)}
 .dayhead{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;cursor:pointer;user-select:none}
 .foldbtn{font-size:12px;padding:4px 10px;border-radius:999px;flex:none}
 .day.collapsed .daytable{display:none}
+.hstrip{display:grid;grid-template-columns:repeat(24,1fr);gap:2px;margin-top:5px}
+.hcell{height:24px;display:flex;align-items:center;justify-content:center;border-radius:4px;background:#f6f7f9;position:relative;overflow:hidden}
+.hcell .ico{width:14px;height:14px}
+.hcell .sw{width:12px;height:12px}
+.hcell .hbar{position:absolute;left:0;right:0;bottom:0;height:3px;opacity:.9}
+.hcell.hoverable{cursor:pointer}
+.hcell.hoverable:hover{background:#eceff4}
 .switch{display:inline-flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;color:#344054}
 .switch input{width:15px;height:15px;accent-color:#2f6ded}
 .dayhead .wd{color:var(--muted);font-weight:400;font-size:12.5px;margin-left:6px}
@@ -403,6 +500,7 @@ tbody tr.hit{background:var(--hit)!important}
 td.t{color:#475467;width:92px}
 td.app{display:flex;align-items:center;gap:7px}
 td.app .sw{width:9px;height:9px;border-radius:3px;flex:none}
+td.app .ico{width:14px;height:14px}
 td.app .exe{color:#b0b7c3;font-size:11.5px;margin-left:2px}
 td.num{text-align:right;color:var(--muted);width:92px}
 .empty{padding:18px;text-align:center;color:var(--muted)}
@@ -470,11 +568,13 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
   <div id="days"></div>
 
   <div class="card note">
-    <b>怎么读：</b>每段色块是一段会话，鼠标移到色带上可看应用与起止时间；
-    点<b>日期那一行</b>可以展开/收起当天的完整会话表（右上角的开关决定默认是否收起）。<br>
+    <b>怎么读：</b>色带上每一块是一段会话，鼠标移上去可看应用与起止时间；
+    色带下面那排小格子是<b>每小时的主力应用</b>（点格子可只看它）；
+    连续使用超过十几分钟的时段，色带上会直接贴出应用图标。<br>
+    点<b>日期那一行</b>可以展开/收起当天的完整会话表（上面的开关决定默认是否收起）。
     灰色斜纹 = 有记录但未归属到应用的空档；空白 = 完全没有记录（关机 / 睡眠 / 记录器未运行）。
     相邻的同一应用记录（间隔 ≤ 3 秒）已合并成一段。<br>
-    <b>保存：</b>右上角“保存本页”可以把当前这份报告存成独立的 HTML 文件（数据在里面，请自己保管）。
+    <b>保存：</b>右上角“保存本页”可以把当前这份报告存成独立的 HTML 文件（图标和数据都在里面，请自己保管）。
   </div>
   <footer>由 <b>时迹 TimeTrace</b> 生成 · 数据来自 <b>RustTimeNoter</b> · __GEN__ · 数据仍在本地，不上传</footer>
 </div>
@@ -512,6 +612,12 @@ function colorOf(a){ return M.colorMap[a] || "#98a2b3"; }
 function labelOf(a){ return M.labels[a] || a; }
 function exeOf(a){ return String(a).split(/[\\/]/).pop(); }
 function pct(v){ return (v*100).toFixed(3); }
+function iconOf(app){ return (M.icons && M.icons[app]) || null; }
+function iconHtml(app){
+  var src = iconOf(app);
+  if (src) return '<img class="ico" src="' + src + '" alt="">';
+  return '<span class="sw" style="background:' + colorOf(app) + '"></span>';
+}
 
 /* ---------- 顶部概览 ---------- */
 function chipHtml(app, secs, opts){
@@ -519,7 +625,7 @@ function chipHtml(app, secs, opts){
   return '<span class="lg' + active + '" data-app="' + esc(app) + '"'
     + (opts && opts.link ? ' data-day="' + esc(opts.link) + '"' : "")
     + ' title="' + esc(app) + '">'
-    + '<span class="sw" style="background:' + colorOf(app) + '"></span>'
+    + iconHtml(app)
     + esc(labelOf(app)) + '<span class="n">' + durTxt(secs) + '</span></span>';
 }
 
@@ -579,7 +685,7 @@ function renderAppTable(){
     var r = M.appStats[i];
     var hay = (labelOf(r.a) + " " + exeOf(r.a) + " " + r.a).toLowerCase();
     rows += '<tr class="approw" data-app="' + esc(r.a) + '" data-hay="' + esc(hay) + '">'
-      + '<td class="app"><span class="sw" style="background:' + colorOf(r.a) + '"></span>'
+      + '<td class="app">' + iconHtml(r.a)
       + esc(labelOf(r.a)) + '<span class="exe">' + esc(exeOf(r.a)) + '</span></td>'
       + '<td class="num">' + durTxt(r.total) + '</td>'
       + '<td>' + r.days + ' 天</td>'
@@ -617,7 +723,7 @@ function ribbonHtml(d){
   var s, i;
   for (i = 0; i < d.sessions.length; i++){
     s = d.sessions[i];
-    segs += '<div class="seg" data-a="' + IDX[s.a] + '" style="left:' + pct(s.t/DAY)
+    segs += '<div class="seg" data-a="' + IDX[s.a] + '" data-w="' + pct(s.d/DAY) + '" style="left:' + pct(s.t/DAY)
           + '%;width:calc(' + pct(s.d/DAY) + '% + 0.7px);background:' + colorOf(s.a) + '"></div>';
   }
   for (i = 0; i < d.gaps.length; i++){
@@ -632,8 +738,7 @@ function axisHtml(){
   var h = "";
   for (var i = 0; i <= 24; i++){
     h += '<div class="tick" style="left:' + (i/24*100) + '%">' + pad(i) + '</div>';
-  }
-  return '<div class="axis">' + h + '</div>';
+  }  return '<div class="axis">' + h + '</div>';
 }
 
 function tableHtml(d){
@@ -643,12 +748,39 @@ function tableHtml(d){
     var s = d.sessions[i];
     rows += '<tr data-a="' + IDX[s.a] + '" data-t="' + s.t + '" data-d="' + s.d + '">'
       + '<td class="t">' + hms(s.t) + '</td><td class="t">' + hms(s.t + s.d) + '</td>'
-      + '<td class="app" title="' + esc(s.a) + '"><span class="sw" style="background:' + colorOf(s.a) + '"></span>'
+      + '<td class="app" title="' + esc(s.a) + '">' + iconHtml(s.a)
       + esc(labelOf(s.a)) + '<span class="exe">' + esc(exeOf(s.a)) + '</span></td>'
       + '<td class="num">' + durTxt(s.d) + '</td></tr>';
   }
   return '<table><thead><tr><th>开始</th><th>结束</th><th>应用</th><th style="text-align:right">时长</th></tr></thead>'
        + '<tbody>' + rows + '</tbody></table>';
+}
+
+/* 每小时主要在用哪个应用：24 个格子，格子里是那个应用的真实图标 */
+function hourIconsHtml(d){
+  var per = [], h, i;
+  for (h = 0; h < 24; h++) per.push({});
+  for (i = 0; i < d.sessions.length; i++){
+    var s = d.sessions[i];
+    for (h = 0; h < 24; h++){
+      var a = Math.max(s.t, h*3600), b = Math.min(s.t + s.d, (h+1)*3600);
+      if (b > a) per[h][s.a] = (per[h][s.a] || 0) + (b - a);
+    }
+  }
+  var out = '<div class="hstrip">';
+  for (h = 0; h < 24; h++){
+    var best = null, bestV = 0, k;
+    for (k in per[h]) if (per[h][k] > bestV){ best = k; bestV = per[h][k]; }
+    if (!best){
+      out += '<div class="hcell"></div>';
+      continue;
+    }
+    out += '<div class="hcell hoverable" data-app="' + esc(best) + '" title="'
+         + pad(h) + ':00 主要在用 ' + esc(labelOf(best)) + '（' + durTxt(bestV) + '）">'
+         + iconHtml(best)
+         + '<span class="hbar" style="background:' + colorOf(best) + '"></span></div>';
+  }
+  return out + '</div>';
 }
 
 function dayHtml(d){
@@ -669,7 +801,7 @@ function dayHtml(d){
     +   '<div><h3>' + d.date + '<span class="wd">星期' + d.weekday + '</span></h3>' + sub + '</div>'
     +   '<button class="foldbtn" data-day="' + d.date + '">展开表格</button>'
     + '</div>'
-    + ribbonHtml(d) + axisHtml()
+    + ribbonHtml(d) + axisHtml() + hourIconsHtml(d)
     + '<div class="chips">' + chips + '</div>'
     + '<div class="daytable">' + tableHtml(d) + '</div>'
     + '</section>';
@@ -681,7 +813,50 @@ function renderDays(){
   for (var i = M.days.length - 1; i >= 0; i--) h += dayHtml(M.days[i]);
   $("#days").innerHTML = h;
   applyFold();
+  decorateRibbons();
 }
+
+/* ---------- 色带上的应用图标（只贴在够宽的会话上） ---------- */
+function decorateRibbons(){
+  var ribs = document.querySelectorAll("#days .ribbon");
+  for (var i = 0; i < ribs.length; i++){
+    var rib = ribs[i];
+    var old = rib.querySelectorAll(".segico");
+    for (var k = 0; k < old.length; k++) rib.removeChild(old[k]);
+    var w = rib.clientWidth;
+    if (!w) continue;
+    var segs = rib.querySelectorAll(".seg[data-a]");
+    var runApp = null, runRight = -1, runIcon = false;
+    for (var j = 0; j < segs.length; j++){
+      var seg = segs[j];
+      var app = APPS[parseInt(seg.getAttribute("data-a"), 10)];
+      var left = parseFloat(seg.style.left) || 0;
+      var wp = parseFloat(seg.getAttribute("data-w")) || 0;
+      // 同一应用、间隔 ≤5 分钟（0.35%）的相邻小块算同一段，只贴一个图标
+      if (!(app === runApp && left - runRight < 0.35)){
+        runApp = app;
+        runIcon = false;
+      }
+      runRight = left + wp;
+      if (runIcon) continue;
+      var src = M.icons && M.icons[app];
+      if (!src) continue;
+      if (wp / 100 * w < 14) continue;
+      var img = document.createElement("img");
+      img.className = "segico";
+      img.alt = "";
+      img.src = src;
+      img.style.left = "calc(" + left + "% + 2px)";
+      rib.appendChild(img);
+      runIcon = true;
+    }
+  }
+}
+var resizeTimer = null;
+window.addEventListener("resize", function(){
+  if (resizeTimer) clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(decorateRibbons, 150);
+});
 
 /* ---------- 表格收起 / 展开 ---------- */
 function setSectionFold(secEl, collapsed){
@@ -777,7 +952,9 @@ function onMove(e){
   var s = d ? sessionAt(d, sec) : null;
   var html;
   if (s){
-    html = "<b>" + esc(labelOf(s.a)) + "</b><br><span class='t'>"
+    var ico = M.icons && M.icons[s.a]
+      ? '<img class="ico" src="' + M.icons[s.a] + '" style="margin-right:5px">' : "";
+    html = ico + "<b>" + esc(labelOf(s.a)) + "</b><br><span class='t'>"
          + hms(s.t) + " – " + hms(s.t + s.d) + " · " + durTxt(s.d) + "</span>";
   } else {
     html = "<span class='t'>" + hms(sec) + " · 这个时刻没有记录</span>";
@@ -820,6 +997,8 @@ function toggleFilter(app){
 function onClick(e){
   var lg = closestClass(e.target, "lg");
   if (lg && lg.getAttribute("data-app")){ toggleFilter(lg.getAttribute("data-app")); return; }
+  var hc = closestClass(e.target, "hcell");
+  if (hc && hc.getAttribute("data-app")){ toggleFilter(hc.getAttribute("data-app")); return; }
   var head = closestClass(e.target, "dayhead");
   if (head){
     var sec = closestClass(head, "day");
@@ -1258,7 +1437,7 @@ def cmd_html(args):
     days = build_days(records)
     if not days:
         sys.exit("这段时间（%s 至 %s）没有任何记录。" % (f, t))
-    model = build_model(days)
+    model = build_model(days, with_icons=not getattr(args, "no_icons", False))
     html = render_html(model)
 
     out = args.out
@@ -1272,6 +1451,9 @@ def cmd_html(args):
     print("覆盖 %s 至 %s，共 %d 天、%d 条会话。"
           % (days[0]["date"], days[-1]["date"], len(days),
              sum(d["stats"]["sessions"] for d in days)))
+    icons = model.get("icons") or {}
+    if icons:
+        print("应用图标：%d/%d 个已内嵌（缓存于 %s）" % (len(icons), len(model["colorMap"]), ICON_CACHE_DIR))
     if not args.no_open:
         try:
             os.startfile(out)  # noqa: S606  (Windows)
@@ -1428,6 +1610,7 @@ def build_parser():
     add_range(h)
     h.add_argument("--out", help="输出 HTML 路径")
     h.add_argument("--no-open", action="store_true", help="只生成文件，不打开浏览器")
+    h.add_argument("--no-icons", action="store_true", help="不提取应用图标，页面里只用色块")
     h.set_defaults(func=cmd_html)
 
     d = sub.add_parser("day", help="控制台打印某天的时间流水")
