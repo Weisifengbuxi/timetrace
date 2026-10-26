@@ -34,7 +34,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -1806,16 +1806,23 @@ def auto_prune(args):
 
 
 def resolve_range(args, default_days=None):
-    """有 --days/--from/--to 就按它；否则用数据目录里保留期内的日子。"""
+    """有 --days/--from/--to 就按它；否则用保留期内的日子。
+
+    注意：日志分片是按 **UTC 日** 命名的，本地日期与它最多差一天。
+    所以结尾一律用「本地今天」，不能拿最后那个分片的文件名当结尾，
+    否则本地 0:00–8:00（UTC+8）这段会被漏掉。
+    """
     if args.days or args.from_day or args.to_day:
         return range_from_args(args)
     days = default_days or getattr(args, "retention", RETENTION_DAYS) or RETENTION_DAYS
     logs = all_log_days()
-    t = logs[-1] if logs else date.today()
+    t = date.today()
     f = logs[0] if logs else t - timedelta(days=days - 1)
     floor = t - timedelta(days=days - 1)
     if f < floor:
         f = floor
+    if f > t:
+        f = t
     return f, t
 
 
@@ -1833,19 +1840,6 @@ def range_from_args(args, default_days=7):
         return f, t
     t = date.today()
     return t - timedelta(days=days - 1), t
-
-
-def resolve_range(args):
-    """有 --days/--from/--to 就按它；否则用数据目录里所有有记录的日子。"""
-    if args.days or args.from_day or args.to_day:
-        return range_from_args(args)
-    logs = all_log_days()
-    t = logs[-1] if logs else date.today()
-    f = logs[0] if logs else t - timedelta(days=6)
-    if (t - f).days > 366:
-        f = t - timedelta(days=366)
-        print("记录超过 366 天，只查最近 366 天。要查更早的请用 --from / --to。")
-    return f, t
 
 
 def cmd_prune(args):
