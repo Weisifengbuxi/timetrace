@@ -33,7 +33,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -180,6 +180,84 @@ def load_usb_events(start_day, end_day):
         })
     events.sort(key=lambda e: (e["date"], e["t"]))
     return events
+
+
+_PS_RECENT_TEMPLATE = r'''
+$recent = Join-Path $env:APPDATA 'Microsoft\Windows\Recent'
+$vols = @{}
+try {
+  Get-Volume -ErrorAction Stop | ForEach-Object {
+    if ($_.DriveLetter) { $vols[[string]$_.DriveLetter] = [string]$_.DriveType }
+  }
+} catch { }
+$sh = New-Object -ComObject WScript.Shell
+$out = New-Object System.Collections.ArrayList
+if (Test-Path $recent) {
+  $links = Get-ChildItem $recent -Filter *.lnk -ErrorAction SilentlyContinue
+  foreach ($l in $links) {
+    try { $t = $sh.CreateShortcut($l.FullName).TargetPath } catch { continue }
+    if (-not $t -or $t -notmatch '^([A-Za-z]):\\') { continue }
+    $d = $matches[1].ToUpper()
+    $type = ''
+    if ($vols.ContainsKey($d)) { $type = $vols[$d] }
+    if ($type -eq 'Fixed' -or $type -eq 'CDRom' -or $type -eq 'Network') { continue }
+    [void]$out.Add([pscustomobject]@{
+      time = $l.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:ss')
+      path = $t
+      drive = $d
+    })
+  }
+}
+$out | ConvertTo-Json -Compress
+'''
+
+
+def load_recent_usb_files():
+    """从「最近使用」里找出指向可移动盘（或当前不存在的盘符）的文件。"""
+    if os.name != "nt":
+        return []
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+             base64.b64encode(_PS_RECENT_TEMPLATE.encode("utf-16-le")).decode("ascii")],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    raw = proc.stdout.decode("utf-8", "replace").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+
+    out, seen = [], set()
+    for item in data:
+        try:
+            path = str(item.get("path") or "")
+            drive = str(item.get("drive") or "").upper()
+            when = datetime.strptime(item.get("time", ""), "%Y-%m-%dT%H:%M:%S")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not path or len(path) < 4:
+            continue
+        key = path.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        midnight = datetime.combine(when.date(), dtime.min)
+        out.append({"date": when.date().isoformat(),
+                    "t": int((when - midnight).total_seconds()),
+                    "path": path, "drive": drive})
+    out.sort(key=lambda e: (e["date"], e["t"]), reverse=True)
+    return out[:300]
 
 
 # --------------------------------------------------------------------------
@@ -570,6 +648,7 @@ input:focus{outline:2px solid rgba(47,109,237,.22);border-color:var(--accent)}
 .hcell .sw{width:12px;height:12px}
 .usbmark{position:absolute;top:0;bottom:0;width:0;border-left:2px dashed #0f766e;opacity:.85;z-index:2;pointer-events:auto}
 .usbmark::after{content:"";position:absolute;top:2px;left:-4px;width:6px;height:6px;border-radius:50%;background:#0f766e}
+.usbpath{max-width:640px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#344054}
 .hcell .hbar{position:absolute;left:0;right:0;bottom:0;height:3px;opacity:.9}
 .hcell.hoverable{cursor:pointer}
 .hcell.hoverable:hover{background:#eceff4}
@@ -643,20 +722,40 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
 
   <div class="card" id="usbcard" style="display:none">
     <div class="row between">
-      <h2 style="margin:0">U 盘接入记录</h2>
+      <h2 style="margin:0">U 盘记录</h2>
       <span id="usbhint" class="hint" style="color:var(--muted);font-size:12px"></span>
     </div>
-    <table class="apptable">
-      <thead><tr>
-        <th style="width:150px">时间</th>
-        <th>设备</th>
-        <th style="width:90px">盘符</th>
-      </tr></thead>
-      <tbody id="usbtbody"></tbody>
-    </table>
-    <div class="note" style="margin-top:8px">
-      来源：Windows 设备日志（Kernel-PnP）。只记接入时刻，不含文件操作，也不写入设备序列号；
-      盘符取自系统挂载记录，可能为「—」（从未分配盘符或已被移除）。
+
+    <div id="usbconnwrap">
+      <h3 style="font-size:13px;margin:14px 0 6px;font-weight:600">接入时刻</h3>
+      <table class="apptable">
+        <thead><tr>
+          <th style="width:150px">时间</th>
+          <th>设备</th>
+          <th style="width:90px">盘符</th>
+        </tr></thead>
+        <tbody id="usbtbody"></tbody>
+      </table>
+    </div>
+
+    <div id="usbfileswrap" style="display:none">
+      <h3 style="font-size:13px;margin:16px 0 6px;font-weight:600">打开过的文件
+        <span id="usbfileshint" class="hint" style="color:var(--muted);font-size:12px;font-weight:400"></span>
+      </h3>
+      <table class="apptable">
+        <thead><tr>
+          <th style="width:150px">时间</th>
+          <th>文件</th>
+          <th style="width:70px">盘符</th>
+        </tr></thead>
+        <tbody id="usbfilestbody"></tbody>
+      </table>
+    </div>
+
+    <div class="note" style="margin-top:10px">
+      接入时刻来自 Windows 设备日志（Kernel-PnP）；文件列表来自「最近使用」记录，
+      只能反映<b>打开/双击过</b>的文件——复制、移动、删除这些操作 Windows 不记录，这里也看不到。
+      不写入设备序列号，也不读取文件内容。
     </div>
   </div>
 
@@ -944,16 +1043,39 @@ function dayHtml(d){
 
 function renderUsb(){
   var list = M.usb || [];
-  if (!list.length) return;
-  var h = "";
-  for (var i = list.length - 1; i >= 0; i--){
-    var e = list[i];
-    h += '<tr><td class="t">' + e.date.slice(5) + " " + hm(e.t) + '</td>'
-       + '<td>USB VID_' + esc(e.vid) + '&amp;PID_' + esc(e.pid) + '</td>'
-       + '<td>' + (e.letter ? esc(e.letter) + ":" : "—") + '</td></tr>';
+  var files = M.usbfiles || [];
+  if (!list.length && !files.length) return;
+
+  if (list.length){
+    var h = "";
+    for (var i = list.length - 1; i >= 0; i--){
+      var e = list[i];
+      h += '<tr><td class="t">' + e.date.slice(5) + " " + hm(e.t) + '</td>'
+         + '<td>USB VID_' + esc(e.vid) + '&amp;PID_' + esc(e.pid) + '</td>'
+         + '<td>' + (e.letter ? esc(e.letter) + ":" : "—") + '</td></tr>';
+    }
+    $("#usbtbody").innerHTML = h;
+  } else {
+    $("#usbconnwrap").style.display = "none";
   }
-  $("#usbtbody").innerHTML = h;
-  $("#usbhint").textContent = "共 " + list.length + " 次 · 来自 Windows 设备日志";
+
+  if (files.length){
+    var fh = "";
+    for (var j = 0; j < files.length; j++){
+      var f = files[j];
+      fh += '<tr><td class="t">' + f.date.slice(5) + " " + hm(f.t) + '</td>'
+          + '<td class="usbpath" title="' + esc(f.path) + '">' + esc(f.path) + '</td>'
+          + '<td>' + esc(f.drive) + ':</td></tr>';
+    }
+    $("#usbfilestbody").innerHTML = fh;
+    $("#usbfileshint").textContent = "共 " + files.length + " 条";
+    $("#usbfileswrap").style.display = "";
+  }
+
+  var bits = [];
+  if (list.length) bits.push("接入 " + list.length + " 次");
+  if (files.length) bits.push("文件 " + files.length + " 条");
+  $("#usbhint").textContent = bits.join(" · ") + " · 来自 Windows 记录";
   $("#usbcard").style.display = "";
 }
 function indexUsb(){
@@ -1602,6 +1724,7 @@ def cmd_html(args):
     if not getattr(args, "no_events", False):
         ef, et = event_range(args, t)
         model["usb"] = load_usb_events(ef, et)
+        model["usbfiles"] = load_recent_usb_files()
     html = render_html(model)
 
     out = args.out
@@ -1621,6 +1744,9 @@ def cmd_html(args):
     usb = model.get("usb") or []
     if usb:
         print("U 盘接入：%d 次（来自 Windows 设备日志）" % len(usb))
+    files = model.get("usbfiles") or []
+    if files:
+        print("U 盘文件：%d 条（来自“最近使用”记录）" % len(files))
     if not args.no_open:
         try:
             os.startfile(out)  # noqa: S606  (Windows)
@@ -1702,6 +1828,7 @@ def cmd_events(args):
     auto_prune(args)
     ef, et = event_range(args)
     events = load_usb_events(ef, et)
+    files = load_recent_usb_files()
     print()
     print("U 盘接入记录 · %s 至 %s" % (ef.isoformat(), et.isoformat()))
     print("-" * 66)
@@ -1712,6 +1839,16 @@ def cmd_events(args):
             extra = ("   盘符 " + e["letter"] + ":") if e["letter"] else ""
             print("  %s %s   USB VID_%s&PID_%s%s" % (e["date"], hms_local(e["t"])[:5],
                                                      e["vid"], e["pid"], extra))
+    print()
+    print("U 盘上打开过的文件（来自“最近使用”）")
+    print("-" * 66)
+    if not files:
+        print(" 没有查到。")
+    else:
+        for f in files[:40]:
+            print("  %s %s   [%s:]  %s" % (f["date"], hms_local(f["t"])[:5], f["drive"], f["path"]))
+        if len(files) > 40:
+            print("  …还有 %d 条" % (len(files) - 40))
     print()
 
 
