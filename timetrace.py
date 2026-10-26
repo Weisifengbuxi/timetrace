@@ -24,6 +24,7 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -33,7 +34,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -258,6 +259,119 @@ def load_recent_usb_files():
                     "path": path, "drive": drive})
     out.sort(key=lambda e: (e["date"], e["t"]), reverse=True)
     return out[:300]
+
+
+# --------------------------------------------------------------------------
+# 浏览器下载记录（Edge / Chrome）里，目标落在 U 盘的那些
+# --------------------------------------------------------------------------
+def drive_kind(letter):
+    """removable / fixed / cdrom / network / absent"""
+    if os.name != "nt":
+        return "unknown"
+    try:
+        import ctypes
+        t = ctypes.windll.kernel32.GetDriveTypeW(letter + ":\\")
+    except Exception:
+        return "unknown"
+    return {1: "absent", 2: "removable", 3: "fixed", 4: "network", 5: "cdrom"}.get(t, "unknown")
+
+
+def _read_browser_downloads(db_path):
+    tmp = tempfile.mkdtemp(prefix="tt_hist_")
+    dst = os.path.join(tmp, "History")
+    try:
+        shutil.copy2(db_path, dst)
+        for ext in ("-wal", "-shm"):
+            src = db_path + ext
+            if os.path.isfile(src):
+                try:
+                    shutil.copy2(src, dst + ext)
+                except OSError:
+                    pass
+        con = sqlite3.connect(dst)
+        try:
+            cur = con.cursor()
+            cur.execute(
+                "SELECT target_path, start_time, COALESCE(total_bytes, received_bytes, 0), "
+                "COALESCE(state, 1) FROM downloads ORDER BY start_time DESC LIMIT 1000"
+            )
+            return cur.fetchall()
+        finally:
+            con.close()
+    except (sqlite3.Error, OSError):
+        return []
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def load_usb_downloads():
+    """返回下载目标是 U 盘（或已拔出盘符）的条目。"""
+    if os.name != "nt":
+        return []
+    base = os.environ.get("LOCALAPPDATA", "")
+    roots = [
+        os.path.join(base, "Microsoft", "Edge", "User Data"),
+        os.path.join(base, "Google", "Chrome", "User Data"),
+    ]
+    out, seen = [], set()
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            profiles = os.listdir(root)
+        except OSError:
+            continue
+        for profile in profiles:
+            db = os.path.join(root, profile, "History")
+            if not os.path.isfile(db):
+                continue
+            for row in _read_browser_downloads(db):
+                try:
+                    target, start, size, state = row
+                except (TypeError, ValueError):
+                    continue
+                if not target or not isinstance(target, str):
+                    continue
+                m = re.match(r"^([A-Za-z]):\\", target)
+                if not m:
+                    continue
+                if state not in (1, 3, 4):  # 1=完成；3/4=中断但目标已确定
+                    continue
+                kind = drive_kind(m.group(1).upper())
+                if kind in ("fixed", "cdrom", "network"):
+                    continue
+                try:
+                    when = datetime.fromtimestamp(start / 1000000.0 - 11644473600)
+                except (OverflowError, OSError, ValueError):
+                    continue
+                key = target.lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                midnight = datetime.combine(when.date(), dtime.min)
+                out.append({
+                    "date": when.date().isoformat(),
+                    "t": int((when - midnight).total_seconds()),
+                    "path": target,
+                    "drive": m.group(1).upper(),
+                    "size": int(size or 0),
+                })
+    out.sort(key=lambda e: (e["date"], e["t"]), reverse=True)
+    return out[:300]
+
+
+def human_size(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return ""
+    if n <= 0:
+        return ""
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%.0f %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+    return ""
 
 
 # --------------------------------------------------------------------------
@@ -752,9 +866,26 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
       </table>
     </div>
 
+    <div id="usbdlwrap" style="display:none">
+      <h3 style="font-size:13px;margin:16px 0 6px;font-weight:600">下载到 U 盘的文件
+        <span id="usbdlhint" class="hint" style="color:var(--muted);font-size:12px;font-weight:400"></span>
+      </h3>
+      <table class="apptable">
+        <thead><tr>
+          <th style="width:150px">时间</th>
+          <th>文件</th>
+          <th style="width:90px">大小</th>
+          <th style="width:70px">盘符</th>
+        </tr></thead>
+        <tbody id="usbdltbody"></tbody>
+      </table>
+    </div>
+
     <div class="note" style="margin-top:10px">
-      接入时刻来自 Windows 设备日志（Kernel-PnP）；文件列表来自「最近使用」记录，
-      只能反映<b>打开/双击过</b>的文件——复制、移动、删除这些操作 Windows 不记录，这里也看不到。
+      接入时刻来自 Windows 设备日志（Kernel-PnP）；「打开过的文件」来自「最近使用」记录；
+      「下载到 U 盘的文件」来自 Edge / Chrome 的下载记录。
+      能看出<b>从 U 盘打开过什么</b>、<b>浏览器下载到 U 盘了什么</b>；
+      资源管理器里的拖拽、复制粘贴、删除，两个方向 Windows 都不记录，这里也看不到。
       不写入设备序列号，也不读取文件内容。
     </div>
   </div>
@@ -1044,7 +1175,8 @@ function dayHtml(d){
 function renderUsb(){
   var list = M.usb || [];
   var files = M.usbfiles || [];
-  if (!list.length && !files.length) return;
+  var dls = M.usbdl || [];
+  if (!list.length && !files.length && !dls.length) return;
 
   if (list.length){
     var h = "";
@@ -1072,11 +1204,32 @@ function renderUsb(){
     $("#usbfileswrap").style.display = "";
   }
 
+  if (dls.length){
+    var dh = "";
+    for (var k = 0; k < dls.length; k++){
+      var d = dls[k];
+      dh += '<tr><td class="t">' + d.date.slice(5) + " " + hm(d.t) + '</td>'
+          + '<td class="usbpath" title="' + esc(d.path) + '">' + esc(d.path) + '</td>'
+          + '<td class="num">' + (d.size ? humanSize(d.size) : "") + '</td>'
+          + '<td>' + esc(d.drive) + ':</td></tr>';
+    }
+    $("#usbdltbody").innerHTML = dh;
+    $("#usbdlhint").textContent = "共 " + dls.length + " 条";
+    $("#usbdlwrap").style.display = "";
+  }
+
   var bits = [];
   if (list.length) bits.push("接入 " + list.length + " 次");
-  if (files.length) bits.push("文件 " + files.length + " 条");
+  if (files.length) bits.push("打开 " + files.length + " 条");
+  if (dls.length) bits.push("下载 " + dls.length + " 条");
   $("#usbhint").textContent = bits.join(" · ") + " · 来自 Windows 记录";
   $("#usbcard").style.display = "";
+}
+function humanSize(n){
+  if (!n || n <= 0) return "";
+  var u = ["B", "KB", "MB", "GB", "TB"], i = 0;
+  while (n >= 1024 && i < u.length - 1){ n /= 1024; i++; }
+  return (i === 0 ? n.toFixed(0) : n.toFixed(1)) + " " + u[i];
 }
 function indexUsb(){
   USB_BY_DATE = {};
@@ -1725,6 +1878,7 @@ def cmd_html(args):
         ef, et = event_range(args, t)
         model["usb"] = load_usb_events(ef, et)
         model["usbfiles"] = load_recent_usb_files()
+        model["usbdl"] = load_usb_downloads()
     html = render_html(model)
 
     out = args.out
@@ -1747,6 +1901,9 @@ def cmd_html(args):
     files = model.get("usbfiles") or []
     if files:
         print("U 盘文件：%d 条（来自“最近使用”记录）" % len(files))
+    dl = model.get("usbdl") or []
+    if dl:
+        print("下载到 U 盘：%d 条（来自浏览器下载记录）" % len(dl))
     if not args.no_open:
         try:
             os.startfile(out)  # noqa: S606  (Windows)
@@ -1849,6 +2006,19 @@ def cmd_events(args):
             print("  %s %s   [%s:]  %s" % (f["date"], hms_local(f["t"])[:5], f["drive"], f["path"]))
         if len(files) > 40:
             print("  …还有 %d 条" % (len(files) - 40))
+    print()
+    print("下载到 U 盘的文件（来自浏览器下载记录）")
+    print("-" * 66)
+    dl = load_usb_downloads()
+    if not dl:
+        print(" 没有查到。")
+    else:
+        for d in dl[:40]:
+            size = human_size(d["size"])
+            print("  %s %s   [%s:]  %s%s" % (d["date"], hms_local(d["t"])[:5], d["drive"],
+                                             d["path"], ("  " + size) if size else ""))
+        if len(dl) > 40:
+            print("  …还有 %d 条" % (len(dl) - 40))
     print()
 
 
