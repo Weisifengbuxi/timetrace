@@ -33,7 +33,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -86,6 +86,100 @@ PALETTE = [
     "#1098ad", "#5c940d", "#f76707", "#4263eb", "#c2255c",
     "#0b7285", "#7950f2", "#2b8a3e",
 ]
+
+
+# --------------------------------------------------------------------------
+# U 盘接入记录：Windows 设备日志（Kernel-PnP）+ 盘符映射
+# --------------------------------------------------------------------------
+_PS_USB_TEMPLATE = r'''
+$start = Get-Date '%s'
+$end = (Get-Date '%s').AddDays(1)
+$ev = Get-WinEvent -FilterHashtable @{LogName='Microsoft-Windows-Kernel-PnP/Configuration'; StartTime=$start; EndTime=$end} -ErrorAction SilentlyContinue
+$letters = @{}
+try {
+  $props = Get-ItemProperty 'HKLM:\SYSTEM\MountedDevices' -ErrorAction Stop
+  foreach ($p in $props.PSObject.Properties) {
+    if ($p.Name -notlike '\DosDevices\??:') { continue }
+    $s = [Text.Encoding]::Unicode.GetString($p.Value)
+    if ($s -match 'USBSTOR#Disk&Ven_([^&]+)&Prod_([^&]+)&Rev_([^#]+)#([^#&]+)') {
+      $letters[$matches[4]] = $p.Name.Substring($p.Name.Length - 2, 1)
+    }
+  }
+} catch { }
+$out = New-Object System.Collections.ArrayList
+foreach ($e in $ev) {
+  if ($e.Id -ne 400 -and $e.Id -ne 410) { continue }
+  if ($e.Message -notmatch 'usbstor\.inf') { continue }
+  $inst = [string]$e.Properties[0].Value
+  if ($inst -notmatch '^USB\\VID_([0-9A-Fa-f]+)&PID_([0-9A-Fa-f]+)\\(.+)$') { continue }
+  $v = $matches[1]; $p2 = $matches[2]; $sn = $matches[3]
+  $letter = ''
+  if ($letters.ContainsKey($sn)) { $letter = $letters[$sn] }
+  [void]$out.Add([pscustomobject]@{
+    time = $e.TimeCreated.ToString('yyyy-MM-ddTHH:mm:ss')
+    vid = $v
+    pid = $p2
+    letter = $letter
+  })
+}
+$out | ConvertTo-Json -Compress
+'''
+
+
+def load_usb_events(start_day, end_day):
+    """读取设备日志里的 U 盘接入事件（只取时间 + VID/PID + 盘符，不取序列号）。"""
+    if os.name != "nt":
+        return []
+    script = _PS_USB_TEMPLATE % (start_day.isoformat(), end_day.isoformat())
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=90,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    raw = proc.stdout.decode("utf-8", "replace").strip()
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        return []
+
+    events = []
+    last_seen = {}
+    for item in data:
+        try:
+            when = datetime.strptime(item.get("time", ""), "%Y-%m-%dT%H:%M:%S")
+            vid = str(item.get("vid") or "")
+            pid = str(item.get("pid") or "")
+            letter = str(item.get("letter") or "").upper().rstrip(":")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not vid or not pid:
+            continue
+        # 同一次插拔会连着写 400/410 两条，5 分钟内同型号合并成一次
+        key = vid + ":" + pid
+        if key in last_seen and (when - last_seen[key]).total_seconds() <= 300:
+            continue
+        last_seen[key] = when
+        midnight = datetime.combine(when.date(), dtime.min)
+        events.append({
+            "date": when.date().isoformat(),
+            "t": int((when - midnight).total_seconds()),
+            "vid": vid,
+            "pid": pid,
+            "letter": letter,
+        })
+    events.sort(key=lambda e: (e["date"], e["t"]))
+    return events
 
 
 # --------------------------------------------------------------------------
@@ -474,6 +568,8 @@ input:focus{outline:2px solid rgba(47,109,237,.22);border-color:var(--accent)}
 .hcell{height:24px;display:flex;align-items:center;justify-content:center;border-radius:4px;background:#f6f7f9;position:relative;overflow:hidden}
 .hcell .ico{width:14px;height:14px}
 .hcell .sw{width:12px;height:12px}
+.usbmark{position:absolute;top:0;bottom:0;width:0;border-left:2px dashed #0f766e;opacity:.85;z-index:2;pointer-events:auto}
+.usbmark::after{content:"";position:absolute;top:2px;left:-4px;width:6px;height:6px;border-radius:50%;background:#0f766e}
 .hcell .hbar{position:absolute;left:0;right:0;bottom:0;height:3px;opacity:.9}
 .hcell.hoverable{cursor:pointer}
 .hcell.hoverable:hover{background:#eceff4}
@@ -542,6 +638,25 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
       <label class="switch"><input type="checkbox" id="fold"> 每天默认收起表格（点日期那一行展开）</label>
       <button id="expandAll" style="font-size:12px;padding:4px 10px;border-radius:999px">全部展开</button>
       <button id="collapseAll" style="font-size:12px;padding:4px 10px;border-radius:999px">全部收起</button>
+    </div>
+  </div>
+
+  <div class="card" id="usbcard" style="display:none">
+    <div class="row between">
+      <h2 style="margin:0">U 盘接入记录</h2>
+      <span id="usbhint" class="hint" style="color:var(--muted);font-size:12px"></span>
+    </div>
+    <table class="apptable">
+      <thead><tr>
+        <th style="width:150px">时间</th>
+        <th>设备</th>
+        <th style="width:90px">盘符</th>
+      </tr></thead>
+      <tbody id="usbtbody"></tbody>
+    </table>
+    <div class="note" style="margin-top:8px">
+      来源：Windows 设备日志（Kernel-PnP）。只记接入时刻，不含文件操作，也不写入设备序列号；
+      盘符取自系统挂载记录，可能为「—」（从未分配盘符或已被移除）。
     </div>
   </div>
 
@@ -731,7 +846,20 @@ function ribbonHtml(d){
     segs += '<div class="seg gap" style="left:' + pct(s.t/DAY) + '%;width:calc(' + pct(s.d/DAY) + '% + 0.7px)"></div>';
   }
   return '<div class="ribbon" data-day="' + d.date + '"><div class="segbase" style="position:absolute;inset:0"></div>'
-       + segs + '<div class="cursorline"></div></div>';
+       + segs + usbMarksHtml(d) + '<div class="cursorline"></div></div>';
+}
+
+/* U 盘接入在色带上的标记 */
+var USB_BY_DATE = {};
+function usbMarksHtml(d){
+  var list = USB_BY_DATE[d.date];
+  if (!list) return "";
+  var h = "";
+  for (var i = 0; i < list.length; i++){
+    h += '<div class="usbmark" style="left:' + (list[i].t / DAY * 100).toFixed(3)
+       + '%" title="U 盘接入 ' + hms(list[i].t) + (list[i].letter ? "（" + list[i].letter + ":）" : "") + '"></div>';
+  }
+  return h;
 }
 
 function axisHtml(){
@@ -796,6 +924,13 @@ function dayHtml(d){
   var chips = "";
   for (var i = 0; i < d.app_totals.length; i++) chips += chipHtml(d.app_totals[i][0], d.app_totals[i][1]);
 
+  var usbList = USB_BY_DATE[d.date];
+  if (usbList && usbList.length){
+    sub += '<div class="daysub" style="color:#0f766e">U 盘接入 ' + usbList.length + ' 次'
+         + '<span class="sep">·</span>' + usbList.map(function(e){ return hm(e.t); }).join("、")
+         + '</div>';
+  }
+
   return '<section class="card day" id="d' + d.date + '">'
     + '<div class="dayhead">'
     +   '<div><h3>' + d.date + '<span class="wd">星期' + d.weekday + '</span></h3>' + sub + '</div>'
@@ -805,6 +940,30 @@ function dayHtml(d){
     + '<div class="chips">' + chips + '</div>'
     + '<div class="daytable">' + tableHtml(d) + '</div>'
     + '</section>';
+}
+
+function renderUsb(){
+  var list = M.usb || [];
+  if (!list.length) return;
+  var h = "";
+  for (var i = list.length - 1; i >= 0; i--){
+    var e = list[i];
+    h += '<tr><td class="t">' + e.date.slice(5) + " " + hm(e.t) + '</td>'
+       + '<td>USB VID_' + esc(e.vid) + '&amp;PID_' + esc(e.pid) + '</td>'
+       + '<td>' + (e.letter ? esc(e.letter) + ":" : "—") + '</td></tr>';
+  }
+  $("#usbtbody").innerHTML = h;
+  $("#usbhint").textContent = "共 " + list.length + " 次 · 来自 Windows 设备日志";
+  $("#usbcard").style.display = "";
+}
+function indexUsb(){
+  USB_BY_DATE = {};
+  var list = M.usb || [];
+  for (var i = 0; i < list.length; i++){
+    var e = list[i];
+    if (!USB_BY_DATE[e.date]) USB_BY_DATE[e.date] = [];
+    USB_BY_DATE[e.date].push(e);
+  }
 }
 
 function renderDays(){
@@ -1121,7 +1280,9 @@ document.getElementById("appq").addEventListener("input", function(){
   updateAppHint(shown, q);
 });
 
+indexUsb();
 renderOverview();
+renderUsb();
 renderAppTable();
 renderDays();
 })();
@@ -1438,6 +1599,9 @@ def cmd_html(args):
     if not days:
         sys.exit("这段时间（%s 至 %s）没有任何记录。" % (f, t))
     model = build_model(days, with_icons=not getattr(args, "no_icons", False))
+    if not getattr(args, "no_events", False):
+        ef, et = event_range(args, t)
+        model["usb"] = load_usb_events(ef, et)
     html = render_html(model)
 
     out = args.out
@@ -1454,6 +1618,9 @@ def cmd_html(args):
     icons = model.get("icons") or {}
     if icons:
         print("应用图标：%d/%d 个已内嵌（缓存于 %s）" % (len(icons), len(model["colorMap"]), ICON_CACHE_DIR))
+    usb = model.get("usb") or []
+    if usb:
+        print("U 盘接入：%d 次（来自 Windows 设备日志）" % len(usb))
     if not args.no_open:
         try:
             os.startfile(out)  # noqa: S606  (Windows)
@@ -1520,6 +1687,32 @@ def print_app_report(model, hits, gap_secs=300, max_hits=8):
     if len(hits) > max_hits:
         print()
         print("（还有 %d 个匹配的应用没列出，查得更精确一些吧）" % (len(hits) - max_hits))
+
+
+def event_range(args, today=None):
+    """U 盘事件单独取范围：默认覆盖整个保留期，而不是只到有应用数据的那天。"""
+    t = today or date.today()
+    if getattr(args, "days", None) or getattr(args, "from_day", None) or getattr(args, "to_day", None):
+        return range_from_args(args)
+    days = getattr(args, "retention", RETENTION_DAYS) or RETENTION_DAYS
+    return t - timedelta(days=days - 1), t
+
+
+def cmd_events(args):
+    auto_prune(args)
+    ef, et = event_range(args)
+    events = load_usb_events(ef, et)
+    print()
+    print("U 盘接入记录 · %s 至 %s" % (ef.isoformat(), et.isoformat()))
+    print("-" * 66)
+    if not events:
+        print(" 这段时间没有查到 U 盘接入记录。")
+    else:
+        for e in events:
+            extra = ("   盘符 " + e["letter"] + ":") if e["letter"] else ""
+            print("  %s %s   USB VID_%s&PID_%s%s" % (e["date"], hms_local(e["t"])[:5],
+                                                     e["vid"], e["pid"], extra))
+    print()
 
 
 def cmd_app(args):
@@ -1611,6 +1804,7 @@ def build_parser():
     h.add_argument("--out", help="输出 HTML 路径")
     h.add_argument("--no-open", action="store_true", help="只生成文件，不打开浏览器")
     h.add_argument("--no-icons", action="store_true", help="不提取应用图标，页面里只用色块")
+    h.add_argument("--no-events", action="store_true", help="不读取 U 盘接入记录")
     h.set_defaults(func=cmd_html)
 
     d = sub.add_parser("day", help="控制台打印某天的时间流水")
@@ -1630,6 +1824,10 @@ def build_parser():
     add_range(ap)
     ap.add_argument("--gap", type=int, default=300, help="间隔多少秒内的使用合并成一个时段（默认 300）")
     ap.set_defaults(func=cmd_app)
+
+    ev = sub.add_parser("events", help="列出 U 盘接入记录（Windows 设备日志）")
+    add_range(ev)
+    ev.set_defaults(func=cmd_events)
 
     pr = sub.add_parser("prune", help="删除超过保留期的日志分片（默认 30 天）")
     pr.add_argument("--days", type=int, default=RETENTION_DAYS, help="保留天数（默认 30）")

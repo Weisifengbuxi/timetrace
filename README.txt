@@ -1,4 +1,4 @@
-时迹 TimeTrace v1.1.0
+时迹 TimeTrace v1.2.0
 =====================
 
 给 RustTimeNoter 装一条时间线：看清「几点几分在用什么软件」。
@@ -25,6 +25,14 @@
 查时间.bat     输入 14:30，回答那一刻在用什么      TimeTrace.exe at "14:30"
 查软件.bat     输入 pallas，查它什么时候被用过     TimeTrace.exe app pallas
 当天记录.bat   把某一天打印成文字流水              TimeTrace.exe day --date 2026-10-26
+查U盘.bat      列出 U 盘什么时候插过              TimeTrace.exe events
+
+U 盘记录
+--------
+页面顶部会多一张「U 盘接入记录」表，数据来自 Windows 设备日志（Kernel-PnP），
+读它不需要管理员权限。只记接入时间 + 设备 ID + 盘符，不读文件内容、不写序列号。
+只有插入时刻，没有拔出时间；从未分配盘符的设备显示「—」。
+不想读设备日志：TimeTrace.exe html --no-events
 
 页面上的按钮
 ------------

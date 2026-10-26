@@ -8,6 +8,7 @@ RustTimeNoter 记下了你每天的电脑使用情况，但它自带的报表只
 - **真实应用图标**：直接从本机 exe 里提取，不是色块猜的
 - 24 小时色带：鼠标移上去就显示那一刻在用什么、这一段从几点到几点
 - **每小时主力应用**：色带下面一排图标，一眼看出每个小时主要在用什么
+- **U 盘接入记录**：从 Windows 设备日志里读出什么时候插过 U 盘、分到哪个盘符
 - 每天一张卡片：应用合计 + 完整会话表，打开即全部展开
 - 查某个软件：看到一个陌生进程名，输入几个字母就知道它什么时候跑过
 - 查某个时刻：输入 `14:30`，直接跳到那一刻并高亮
@@ -21,12 +22,12 @@ RustTimeNoter 记下了你每天的电脑使用情况，但它自带的报表只
 ## 快速开始
 
 1. 先装好 **RustTimeNoter**（本工具只读它的数据，不记录任何东西）
-2. 下载 [`TimeTrace-1.1.0-win64.zip`](../../releases/download/v1.1.0/TimeTrace-1.1.0-win64.zip)（约 8.6 MB，或到 [Releases](../../releases) 看所有版本），解压到任意位置
+2. 下载 [`TimeTrace-1.2.0-win64.zip`](../../releases/download/v1.2.0/TimeTrace-1.2.0-win64.zip)（约 8.6 MB，或到 [Releases](../../releases) 看所有版本），解压到任意位置
 3. 双击 **`时间线.bat`** —— 浏览器会打开时间线页面
 
 不需要安装 Python、不需要管理员权限、不写注册表、不联网。
 
-## 四个入口
+## 五个入口
 
 | 双击 | 作用 | 等价命令 |
 | --- | --- | --- |
@@ -34,6 +35,7 @@ RustTimeNoter 记下了你每天的电脑使用情况，但它自带的报表只
 | `查时间.bat` | 输入 `14:30`，回答那一刻在用什么 | `TimeTrace.exe at "14:30"` |
 | `查软件.bat` | 输入 `pallas`，回答这个程序什么时候被用过 | `TimeTrace.exe app pallas` |
 | `当天记录.bat` | 把某一天打印成文字流水 | `TimeTrace.exe day --date 2026-10-26` |
+| `查U盘.bat` | 列出 U 盘什么时候插过 | `TimeTrace.exe events` |
 
 ## 时间线页面
 
@@ -53,6 +55,27 @@ RustTimeNoter 记下了你每天的电脑使用情况，但它自带的报表只
 色带下面那排小格子是**每小时的主力应用**，点格子就只看它：
 
 ![每天卡片](screenshot-day.png)
+
+## U 盘接入记录
+
+页面顶部会多一张「U 盘接入记录」表，列出保留期内每一次 U 盘接入：
+
+| 时间 | 设备 | 盘符 |
+| --- | --- | --- |
+| 10-23 20:52 | USB VID_346D&PID_5678 | — |
+
+- **来源**：Windows 设备日志 `Microsoft-Windows-Kernel-PnP/Configuration`（读它不需要管理员权限）。
+  只取设备实例形如 `USB\VID_*`、且驱动是 `usbstor.inf` 的设备，也就是 U 盘 / USB 移动硬盘；
+  键盘鼠标、蓝牙适配器、摄像头这些不会被算进来
+- **只有接入时刻**：不记录插了哪些文件、拷了什么，也**不写入设备序列号**；
+  同一次插拔系统会连着写两条事件，5 分钟内的同型号会合并成一次
+- **盘符**：从系统挂载记录 `HKLM\SYSTEM\MountedDevices` 里按设备反查；
+  如果这块盘从没分配过盘符、或者挂载记录已被清掉，就显示 `—`
+- **范围**：默认最近 30 天（和保留期一致），`--days 7`、`--from/--to` 同样生效；
+  所以即使某天完全没打开过电脑，只要 Windows 记了设备事件，也能看到
+- 当天色带上会画一条青色虚线标记接入时刻；那天如果本来就没有应用记录，
+  这次接入只在顶部这张表里出现
+- 不想读设备日志可以加 `--no-events`
 
 ## 保留 30 天，过期自动清理
 
@@ -74,13 +97,14 @@ TimeTrace.exe html --from 2026-10-01 --to 2026-10-31
 TimeTrace.exe html --out report.html --no-open
 TimeTrace.exe at "14:30" --context 20  某一时刻 + 前后 20 分钟
 TimeTrace.exe app pallas --gap 600     查应用；间隔 10 分钟内的使用合并成一个时段
+TimeTrace.exe events                   列出 U 盘接入记录
 TimeTrace.exe day --date 2026-10-26    某天的文字流水
 TimeTrace.exe prune --dry-run          预演清理
 TimeTrace.exe --version
 ```
 
-`html` / `day` / `app` 都支持 `--days`、`--from`、`--to`、`--retention`、`--no-prune`；
-`html` 还支持 `--no-icons`（不取图标，页面里只用色块）。
+`html` / `day` / `app` / `events` 都支持 `--days`、`--from`、`--to`、`--retention`、`--no-prune`；
+`html` 还支持 `--no-icons`（不取图标，页面里只用色块）和 `--no-events`（不读 U 盘记录）。
 
 ## 应用图标是怎么来的
 
@@ -101,6 +125,7 @@ TimeTrace.exe --version
 
 - 数据始终在 `%LOCALAPPDATA%\RustTimeNoter`，时迹只读取此数据
 - 应用图标从本机 exe 本地提取，只存在本机缓存目录，同样不上传
+- U 盘记录读取的是本机 Windows 设备日志，只取时间 + 设备 ID + 盘符，不读文件内容、不存序列号
 - 页面是本地静态 HTML，数据内嵌其中，不会上传任何东西
 - 本工具不收集遥测、不含网络请求
 
