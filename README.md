@@ -1,6 +1,6 @@
 # 时迹 TimeTrace
 
-**给 RustTimeNoter 装一条时间线：一眼看清「几点几分在用什么软件」。**
+**给 RustTimeNoter 装一条时间线：一眼看清「什么时候用了什么软件」。**
 
 RustTimeNoter 记下了你每天的电脑使用情况，但它自带的报表只回答「某个应用一共用了多久」。
 时迹读它的数据，把零散记录还原成一段段会话，生成一张**本地、离线、可搜索**的时间线：
@@ -23,9 +23,6 @@ RustTimeNoter 记下了你每天的电脑使用情况，但它自带的报表只
 3. 双击 **`时间线.bat`** —— 浏览器会打开时间线页面
 
 不需要安装 Python、不需要管理员权限、不写注册表、不联网。
-
-> 目录里 `TimeTrace.exe` 是主程序；四个 `.bat` 只是双击入口（带控制台窗口）。
-> 想直接跑命令，用 `TimeTrace.exe` 即可。
 
 ## 四个入口
 
@@ -60,7 +57,7 @@ RustTimeNoter 记下了你每天的电脑使用情况，但它自带的报表只
 - 改保留期：`TimeTrace.exe prune --days 60` 或 `TimeTrace.exe html --retention 60`
 - 临时不清理：`TimeTrace.exe html --no-prune`
 
-> **注意：这是硬删除，不进回收站。** 想长期留存请用页面上的「保存本页」，或定期备份数据目录。
+> **注意：这是硬删除，不进回收站。** 想长期留存请用页面上的「保存本页」，或定期备份数据目录，或fork到自己仓库修改为你需要的范围。
 
 ## 命令行
 
@@ -80,9 +77,8 @@ TimeTrace.exe --version
 
 ## 隐私
 
-- 数据始终在 `%LOCALAPPDATA%\RustTimeNoter`，时迹只读取它
+- 数据始终在 `%LOCALAPPDATA%\RustTimeNoter`，时迹只读取此数据
 - 页面是本地静态 HTML，数据内嵌其中，不会上传任何东西
-- 「保存本页」得到的文件包含你的完整操作记录，请自行保管
 - 本工具不收集遥测、不含网络请求
 
 ## 常见问题
@@ -122,15 +118,15 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 时迹是在别人的基础上做的：
 
-- **RustTimeNoter** —— 真正干活的采集器。它负责把前台窗口、使用时长、AFK 判定这些
-  原始数据记下来并加密存放在 `%LOCALAPPDATA%\RustTimeNoter`；本工具一行采集代码都没有，
+- **RustTimeNoter** 是采集器。它负责把前台窗口、使用时长、AFK 判定这些
+  原始数据记下来并加密存放在 `%LOCALAPPDATA%\RustTimeNoter`，
   只是读它导出的数据、把它变成看得懂的时间线。没有 RustTimeNoter，就没有这个页面。
   RustTimeNoter 及其版权归原作者所有。
-- 感谢 RustTimeNoter 的作者把「按 UTC 日分片 + 加密日志 + 官方导出接口」这套东西做稳了，
+- 感谢 RustTimeNoter 的作者把「按 UTC 日分片 + 加密日志 + 官方导出接口」这套东西做的十分完善，
   时迹才能只靠 `tracker export` 就拿到完整数据。
+- 选择在**RustTimeNoter**优化是因为我很喜欢它的开机自启功能，如果能加个图标就更好了（后续优化方向）
 
-RustTimeNoter 的项目主页目前在网络上没有可以直接引用的地址（要跳转几次才能到），
-所以这里以项目名致谢；如果你知道它的作者或主页，欢迎开 issue 补充。
+RustTimeNoter 这个软件还是比较知名的，这里就不给出它的仓库地址了，所以这里以项目名致谢
 
 ## 许可
 
