@@ -31,7 +31,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -476,7 +476,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     相邻的同一应用记录（间隔 ≤ 3 秒）已合并成一段。<br>
     <b>保存：</b>右上角“保存本页”可以把当前这份报告存成独立的 HTML 文件（数据在里面，请自己保管）。
   </div>
-  <footer>由 <b>时迹 TimeTrace</b> 基于 <span class="kbd">tracker export</span> 生成 · __GEN__ · 数据仍在本地，不上传</footer>
+  <footer>由 <b>时迹 TimeTrace</b> 生成 · 数据来自 <b>RustTimeNoter</b> · __GEN__ · 数据仍在本地，不上传</footer>
 </div>
 <div class="tip" id="tip"></div>
 <script id="data" type="application/json">__DATA__</script>

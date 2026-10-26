@@ -11,12 +11,15 @@ RustTimeNoter 记下了你每天的电脑使用情况，但它自带的报表只
 - 查某个时刻：输入 `14:30`，直接跳到那一刻并高亮
 - 保存成独立 HTML：一份报告一个文件，存档、发给自己都行
 
+> 时迹**不是**数据采集器。记录原始数据的是 **RustTimeNoter**，本项目只是它的查看器，
+> 详见文末[致谢](#致谢)。
+
 ![时迹界面](screenshot.png)
 
 ## 快速开始
 
 1. 先装好 **RustTimeNoter**（本工具只读它的数据，不记录任何东西）
-2. 下载 [`TimeTrace-1.0.0-win64.zip`](../../releases/download/v1.0.0/TimeTrace-1.0.0-win64.zip)（8.6 MB，或到 [Releases](../../releases) 看所有版本），解压到任意位置
+2. 下载 [`TimeTrace-1.0.1-win64.zip`](../../releases/download/v1.0.1/TimeTrace-1.0.1-win64.zip)（约 8.6 MB，或到 [Releases](../../releases) 看所有版本），解压到任意位置
 3. 双击 **`时间线.bat`** —— 浏览器会打开时间线页面
 
 不需要安装 Python、不需要管理员权限、不写注册表、不联网。
@@ -115,8 +118,22 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 
 会调用 PyInstaller 生成 `dist\TimeTrace.exe`（需要 `pip install pyinstaller`）。
 
+## 致谢
+
+时迹是在别人的基础上做的：
+
+- **RustTimeNoter** —— 真正干活的采集器。它负责把前台窗口、使用时长、AFK 判定这些
+  原始数据记下来并加密存放在 `%LOCALAPPDATA%\RustTimeNoter`；本工具一行采集代码都没有，
+  只是读它导出的数据、把它变成看得懂的时间线。没有 RustTimeNoter，就没有这个页面。
+  RustTimeNoter 及其版权归原作者所有。
+- 感谢 RustTimeNoter 的作者把「按 UTC 日分片 + 加密日志 + 官方导出接口」这套东西做稳了，
+  时迹才能只靠 `tracker export` 就拿到完整数据。
+
+RustTimeNoter 的项目主页目前在网络上没有可以直接引用的地址（要跳转几次才能到），
+所以这里以项目名致谢；如果你知道它的作者或主页，欢迎开 issue 补充。
+
 ## 许可
 
 MIT，见 [LICENSE](LICENSE)。
 
-时迹是社区工具，与 RustTimeNoter 作者无关；RustTimeNoter 本身的版权归其作者。
+时迹与 RustTimeNoter 作者无关，是社区写的第三方查看器；RustTimeNoter 的名称与代码版权归其作者。
