@@ -22,7 +22,7 @@ RustTimeNoter 记下了你每天的电脑使用情况，但它自带的报表只
 ## 快速开始
 
 1. 先装好 **RustTimeNoter**（本工具只读它的数据；没装的话时迹也会提示你）
-2. 下载 [`TimeTrace-1.6.0-win64.zip`](../../releases/download/v1.6.0/TimeTrace-1.6.0-win64.zip)（约 27 MB，或到 [Releases](../../releases) 看所有版本），解压到任意位置
+2. 下载 [`TimeTrace-1.6.1-win64.zip`](../../releases/download/v1.6.1/TimeTrace-1.6.1-win64.zip)（约 27 MB，或到 [Releases](../../releases) 看所有版本），解压到任意位置
 3. 双击 **`时迹.bat`** —— 右下角出现托盘图标，控制台窗口自动隐藏
 
 不需要安装 Python、不需要管理员权限、不联网。

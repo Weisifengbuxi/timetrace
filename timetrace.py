@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -2371,17 +2371,84 @@ def hide_console():
         pass
 
 
-def single_instance(name="Global\\TimeTraceTray"):
+def single_instance(name="TimeTraceTray_SingleInstance"):
+    """同一会话里的单实例。用会话内名字，普通用户也能创建（用 Global 前缀需要特权）。"""
     if os.name != "nt":
         return object()
     try:
         import ctypes
-        handle = ctypes.windll.kernel32.CreateMutexW(None, False, name)
-        if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW.restype = ctypes.c_void_p
+        k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_bool, ctypes.c_wchar_p]
+        handle = k32.CreateMutexW(None, False, name)
+        err = ctypes.get_last_error()
+        if not handle:
+            return object()
+        if err == 183:  # ERROR_ALREADY_EXISTS
             return None
         return handle
     except Exception:
         return object()
+
+
+def promote_tray_icon():
+    """把托盘图标标记为“始终显示”，否则新图标会被 Windows 收进 ^ 里。"""
+    if os.name != "nt":
+        return
+    try:
+        import winreg
+        target = os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__).lower()
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Control Panel\NotifyIconSettings", 0,
+                             winreg.KEY_READ | winreg.KEY_SET_VALUE)
+    except OSError:
+        return
+    try:
+        count = winreg.QueryInfoKey(key)[1]
+        for i in range(count):
+            sub = winreg.EnumKey(key, i)
+            try:
+                with winreg.OpenKey(key, sub, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as sk:
+                    try:
+                        path, _ = winreg.QueryValueEx(sk, "ExecutablePath")
+                    except OSError:
+                        continue
+                    if os.path.abspath(str(path)).lower() == target:
+                        winreg.SetValueEx(sk, "IsPromoted", 0, winreg.REG_DWORD, 1)
+            except OSError:
+                continue
+    finally:
+        winreg.CloseKey(key)
+
+
+def tray_first_run_hint():
+    """第一次启动时提示一下图标藏在 ^ 里。"""
+    base = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace")
+    flag = os.path.join(base, "tray-hint.flag")
+    if os.path.isfile(flag):
+        return
+    try:
+        os.makedirs(base, exist_ok=True)
+        with open(flag, "w", encoding="utf-8") as fp:
+            fp.write("1")
+    except OSError:
+        return
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "时迹已经在右下角运行。\n\n"
+            "如果没看到图标：点任务栏时钟旁边的「^」，\n"
+            "找到时迹图标，把它拖到任务栏上固定即可。",
+            "时迹 TimeTrace", 0x40)
+    except Exception:
+        pass
+
+
+def _tray_post_start():
+    time.sleep(1.5)
+    promote_tray_icon()
+    tray_first_run_hint()
 
 
 def tray_base_command():
@@ -2522,6 +2589,8 @@ def run_tray():
         MenuItem("退出", do_quit),
     )
     icon = Icon("TimeTrace", make_tray_image(), "时迹 TimeTrace", menu)
+    import threading
+    threading.Thread(target=_tray_post_start, daemon=True).start()
     icon.run()
 
 
