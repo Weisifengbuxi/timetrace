@@ -1,6 +1,6 @@
 # Build TimeTrace.exe with PyInstaller.
 #   powershell -ExecutionPolicy Bypass -File build.ps1
-# Requires: Python 3.9+ and  pip install pyinstaller
+# Requires: Python 3.9+ and  pip install pyinstaller pystray pillow
 
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
@@ -9,7 +9,8 @@ $common = @(
     "--onefile", "--noconfirm", "--clean",
     "--name", "TimeTrace",
     "--distpath", "dist", "--workpath", "build\tmp", "--specpath", "build",
-    "--exclude-module", "tkinter",
+    "--icon", (Join-Path $PSScriptRoot "icon.ico"),
+    "--hidden-import", "pystray._win32",
     "--exclude-module", "unittest",
     "--exclude-module", "pydoc",
     "--exclude-module", "email",

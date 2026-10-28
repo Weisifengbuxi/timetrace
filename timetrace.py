@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -1909,6 +1909,11 @@ def cmd_html(args):
 
 def cmd_day(args):
     auto_prune(args)
+    if getattr(args, "ask", False) and not args.date:
+        try:
+            args.date = input("日期（YYYY-MM-DD，直接回车 = 最近一天）：").strip() or None
+        except (EOFError, KeyboardInterrupt):
+            return
     if args.date and not (args.days or args.from_day or args.to_day):
         f = t = datetime.strptime(args.date, "%Y-%m-%d").date()
     else:
@@ -2091,6 +2096,8 @@ def build_parser():
     p.add_argument("--version", action="version",
                    version="%(prog)s " + VERSION + "  (RustTimeNoter 时间线查看器)")
     p.add_argument("--menu", action="store_true", help="打开交互菜单（不带参数时默认也会打开）")
+    p.add_argument("--tray", action="store_true", help="在右下角显示托盘图标")
+    p.add_argument("--pause", action="store_true", help="命令结束后等待回车（托盘调用时用）")
     sub = p.add_subparsers(dest="cmd")
 
     def add_range(sp, default_days=None):
@@ -2113,6 +2120,7 @@ def build_parser():
     d = sub.add_parser("day", help="控制台打印某天的时间流水")
     add_range(d, default_days=7)
     d.add_argument("--date", help="指定日期 YYYY-MM-DD（默认最近一天）")
+    d.add_argument("--ask", action="store_true", help="先询问要哪一天")
     d.set_defaults(func=cmd_day)
 
     a = sub.add_parser("at", help="查询某一时刻在用什么")
@@ -2131,6 +2139,9 @@ def build_parser():
     ev = sub.add_parser("events", help="列出 U 盘接入记录（Windows 设备日志）")
     add_range(ev)
     ev.set_defaults(func=cmd_events)
+
+    st = sub.add_parser("status", help="显示记录器状态与数据位置")
+    st.set_defaults(func=cmd_status)
 
     pr = sub.add_parser("prune", help="删除超过保留期的日志分片（默认 30 天）")
     pr.add_argument("--days", type=int, default=RETENTION_DAYS, help="保留天数（默认 30）")
@@ -2342,6 +2353,187 @@ def interactive_menu():
             return
 
 
+# --------------------------------------------------------------------------
+# 托盘图标（右下角）
+# --------------------------------------------------------------------------
+TRAY_RUN_VALUE = "TimeTraceTray"
+
+
+def hide_console():
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+    except Exception:
+        pass
+
+
+def single_instance(name="Global\\TimeTraceTray"):
+    if os.name != "nt":
+        return object()
+    try:
+        import ctypes
+        handle = ctypes.windll.kernel32.CreateMutexW(None, False, name)
+        if ctypes.windll.kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            return None
+        return handle
+    except Exception:
+        return object()
+
+
+def tray_base_command():
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
+    return [sys.executable, os.path.abspath(__file__)]
+
+
+def spawn_engine(arg_list, console=True):
+    """以子进程运行自己（菜单里的各项操作）。console=True 时弹一个控制台窗口。"""
+    cmd = tray_base_command() + list(arg_list)
+    flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if console else getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        subprocess.Popen(cmd, creationflags=flags, close_fds=True)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _run_key():
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+        return winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                              r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
+                              winreg.KEY_READ | winreg.KEY_SET_VALUE)
+    except OSError:
+        return None
+
+
+def tray_autostart_on():
+    key = _run_key()
+    if key is None:
+        return False
+    try:
+        import winreg
+        try:
+            value, _type = winreg.QueryValueEx(key, TRAY_RUN_VALUE)
+        except OSError:
+            return False
+        return "--tray" in str(value)
+    finally:
+        winreg.CloseKey(key)
+
+
+def set_tray_autostart(enabled):
+    key = _run_key()
+    if key is None:
+        return False
+    try:
+        import winreg
+        if enabled:
+            target = subprocess.list2cmdline(tray_base_command() + ["--tray"])
+            winreg.SetValueEx(key, TRAY_RUN_VALUE, 0, winreg.REG_SZ, target)
+        else:
+            try:
+                winreg.DeleteValue(key, TRAY_RUN_VALUE)
+            except OSError:
+                pass
+        return True
+    except OSError:
+        return False
+    finally:
+        winreg.CloseKey(key)
+
+
+def make_tray_image():
+    from PIL import Image, ImageDraw
+    size = 64
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle([3, 3, size - 4, size - 4], radius=15, fill=(47, 109, 237, 255))
+    d.ellipse([15, 15, size - 16, size - 16], outline=(255, 255, 255, 255), width=4)
+    d.line([32, 32, 32, 20], fill=(255, 255, 255, 255), width=4)
+    d.line([32, 32, 42, 39], fill=(255, 255, 255, 255), width=4)
+    return img
+
+
+def run_tray():
+    try:
+        from pystray import Icon, Menu, MenuItem
+    except ImportError:
+        sys.exit("托盘模式需要 pystray 和 Pillow：pip install pystray pillow（或用打包好的 TimeTrace.exe）")
+
+    guard = single_instance()
+    if guard is None:
+        return
+
+    hide_console()
+
+    # 记录器没跑就拉起来
+    try:
+        ensure_daemon()
+    except SystemExit:
+        pass
+
+    state = {"autostart": tray_autostart_on()}
+
+    def do_timeline(icon=None, item=None):
+        spawn_engine(["html"], console=False)
+
+    def do_at(icon=None, item=None):
+        spawn_engine(["--pause", "at"], console=True)
+
+    def do_app(icon=None, item=None):
+        spawn_engine(["--pause", "app"], console=True)
+
+    def do_events(icon=None, item=None):
+        spawn_engine(["--pause", "events"], console=True)
+
+    def do_day(icon=None, item=None):
+        spawn_engine(["--pause", "day", "--ask"], console=True)
+
+    def do_status(icon=None, item=None):
+        spawn_engine(["--pause", "status"], console=True)
+
+    def toggle_autostart(icon=None, item=None):
+        state["autostart"] = not state["autostart"]
+        if not set_tray_autostart(state["autostart"]):
+            state["autostart"] = tray_autostart_on()
+        try:
+            icon.update_menu()
+        except Exception:
+            pass
+
+    def do_quit(icon=None, item=None):
+        icon.stop()
+
+    menu = Menu(
+        MenuItem("打开时间线（所有日子、图标、U 盘）", do_timeline, default=True),
+        MenuItem("查某个时刻在用什么", do_at),
+        MenuItem("查某个软件什么时候被用过", do_app),
+        MenuItem("查 U 盘：接入 / 打开 / 下载", do_events),
+        MenuItem("某个日期的文字流水", do_day),
+        MenuItem("记录器状态与数据位置", do_status),
+        Menu.SEPARATOR,
+        MenuItem("开机自动启动", toggle_autostart, checked=lambda item: state["autostart"]),
+        MenuItem("退出", do_quit),
+    )
+    icon = Icon("TimeTrace", make_tray_image(), "时迹 TimeTrace", menu)
+    icon.run()
+
+
+def cmd_status(args):
+    text = _run_tracker(["status"]).strip()
+    print(text or "记录器没有响应。")
+    print()
+    print("数据目录：%s" % os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustTimeNoter"))
+    print("图标缓存：%s" % ICON_CACHE_DIR)
+    print("托盘开机自启：%s" % ("已开启" if tray_autostart_on() else "未开启"))
+
+
 def main():
     setup_console()
     if hasattr(sys.stdout, "reconfigure"):
@@ -2352,6 +2544,9 @@ def main():
             pass
     parser = build_parser()
     args = parser.parse_args()
+    if getattr(args, "tray", False):
+        run_tray()
+        return
     if getattr(args, "menu", False):
         interactive_menu()
         return
@@ -2367,6 +2562,9 @@ def main():
         return
     try:
         args.func(args)
+    except SystemExit as exc:
+        if exc.code not in (None, 0):
+            print(exc.code)
     except BrokenPipeError:
         try:
             sys.stdout.close()
@@ -2374,6 +2572,12 @@ def main():
             pass
     except KeyboardInterrupt:
         print()
+    finally:
+        if getattr(args, "pause", False):
+            try:
+                input("\n按回车关闭窗口…")
+            except (EOFError, KeyboardInterrupt, OSError):
+                pass
 
 
 if __name__ == "__main__":
