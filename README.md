@@ -21,39 +21,51 @@ RustTimeNoter 记下了你每天的电脑使用情况，但它自带的报表只
 
 ## 快速开始
 
-1. 先装好 **RustTimeNoter**（本工具只读它的数据；没装的话时迹也会提示你）
-2. 下载 [`TimeTrace-1.6.2-win64.zip`](../../releases/download/v1.6.2/TimeTrace-1.6.2-win64.zip)（约 27 MB，或到 [Releases](../../releases) 看所有版本），解压到任意位置
-3. 双击 **`时迹.bat`** —— 右下角出现托盘图标，控制台窗口自动隐藏
+1. 下载 [`TimeTrace-Setup-2.0.0-win64.zip`](../../releases/download/v2.0.0/TimeTrace-Setup-2.0.0-win64.zip)（约 28 MB，或到 [Releases](../../releases) 看所有版本）
+2. 解压到任意位置，双击 **`安装.bat`**
+3. 右下角出现 RustTimeNoter 图标 —— 右键就是全部功能
 
-不需要安装 Python、不需要管理员权限、不联网。
+不需要管理员权限、不需要装 Python、不需要另外安装 RustTimeNoter（安装包里已经带有改好的版本）。
+卸载运行同目录的 `卸载.bat`，数据会保留。
 
 ## 托盘图标
 
-双击 `时迹.bat` 后，右下角会出现一个托盘图标，**图标就是 RustTimeNoter 自己的图标**
-（从 `tracker.exe` 提取并缓存到 `%LOCALAPPDATA%\TimeTrace\tracker-icon.png`），
-名字显示为「RustTimeNoter · 时迹」，所以看着就是原来那个程序。**右键**是菜单：
+安装后**只有一个图标**（和原来 RustTimeNoter 一样，带时迹的时钟图标）。
+右键菜单：
 
 | 菜单项 | 作用 |
 | --- | --- |
-| 打开时间线（所有日子、图标、U 盘） | 生成并打开时间线页面（**左键单击图标**也是这个） |
+| 打开时间线 | 生成并打开时间线页面（**左键双击图标**也是这个） |
 | 查某个时刻在用什么 | 输入 `14:30`，回答那一刻在用什么 |
 | 查某个软件什么时候被用过 | 输入 `pallas`，查它什么时候跑过 |
-| 查 U 盘：接入 / 打开 / 下载 | 三段式 U 盘记录 |
-| 某个日期的文字流水 | 输入日期，打印当天的流水 |
+| 查 U 盘 | 接入时刻 / 打开过的文件 / 下载记录 |
+| 查看某一天的使用记录 | 输入日期，打印当天的时间流水 |
 | 记录器状态与数据位置 | 记录器是否在跑、数据与缓存路径 |
-| RustTimeNoter 原版报表 | 调起 tracker 自带的报表页 |
+| 打开原版报表 | 调起 RustTimeNoter 自带的报表页 |
 | 打开数据目录 | 打开 `%LOCALAPPDATA%\RustTimeNoter` |
-| 停止记录器 | 停掉采集（会先确认） |
-| 开机自动启动 | 勾选后时迹随开机进托盘 |
-| 退出 | 关掉托盘图标（不影响记录器） |
+| 停止记录 | 停掉采集 |
 
 几个细节：
 
-- 托盘启动时会**自动确保记录器在跑**；没有开机自启也会提醒（可在菜单里勾选）
-- 选中的操作会弹一个小控制台窗口显示结果，看完关掉就回到托盘
-- 已经有一个托盘在跑时，再双击 `时迹.bat` 不会开第二个
-- 原版报表、数据目录、停止记录器都收进来了，所以**可以把系统托盘里原来那个
-  RustTimeNoter 图标关掉**，只留这一个：设置 → 个性化 → 任务栏 → 其他系统托盘图标
+- 菜单是**改在 RustTimeNoter 自己的托盘代码里**（`src/daemon/tray.rs`），不是另开一个程序
+- 选中的操作会弹一个小控制台窗口显示结果，关掉就回到托盘
+- 原版报表、数据目录、停止记录都保留了
+
+## 关于这个安装包
+
+包里有两样东西：
+
+| 文件 | 说明 |
+| --- | --- |
+| `TimeTrace.exe` | 时迹本体（时间线页面、查应用、U 盘记录、清理） |
+| `RustTimeNoter\tracker.exe` | **改过的** RustTimeNoter（MIT 许可），只改了托盘菜单：新增上面 6 项、换成中文、加了图标 |
+
+采集、加密、存储逻辑一行没动，数据格式完全兼容；原版程序在安装时会备份成
+`tracker.exe.orig`，卸载时自动恢复。RustTimeNoter 的原始许可见 `RustTimeNoter\LICENSE`。
+
+自己编译改版：源码在 [Weisifengbuxi/RustTimeNoter](https://github.com/Weisifengbuxi/RustTimeNoter)，
+改动就是 `src/daemon/tray.rs`（菜单项 + 调用 TimeTrace.exe），另外 `build.rs` 里用
+`winresource` 嵌入了 `icon.ico`。构建：`vcvars64.bat && cargo build --release`。
 
 ## 命令行（脚本或快捷方式里用）
 

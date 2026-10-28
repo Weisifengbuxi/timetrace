@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "1.6.2"
+VERSION = "1.7.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -2143,6 +2143,12 @@ def build_parser():
     st = sub.add_parser("status", help="显示记录器状态与数据位置")
     st.set_defaults(func=cmd_status)
 
+    ins = sub.add_parser("install", help="安装时迹 + 改版 RustTimeNoter（复制到 LOCALAPPDATA）")
+    ins.set_defaults(func=cmd_install)
+
+    uni = sub.add_parser("uninstall", help="卸载时迹，恢复原版 tracker.exe")
+    uni.set_defaults(func=cmd_uninstall)
+
     pr = sub.add_parser("prune", help="删除超过保留期的日志分片（默认 30 天）")
     pr.add_argument("--days", type=int, default=RETENTION_DAYS, help="保留天数（默认 30）")
     pr.add_argument("--dry-run", action="store_true", help="只列出会删什么，不真的删除")
@@ -2674,6 +2680,124 @@ def cmd_status(args):
     print("数据目录：%s" % os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustTimeNoter"))
     print("图标缓存：%s" % ICON_CACHE_DIR)
     print("托盘开机自启：%s" % ("已开启" if tray_autostart_on() else "未开启"))
+
+
+def _local_dirs():
+    base = os.environ.get("LOCALAPPDATA", "")
+    rtn = os.path.join(base, "RustTimeNoter")
+    tt = os.path.join(base, "TimeTrace")
+    return rtn, os.path.join(rtn, "bin"), tt
+
+
+def cmd_install(args):
+    """把时迹 + 改过的 RustTimeNoter 装到 %LOCALAPPDATA%，并设好开机自启。"""
+    here = app_dir()
+    src_tracker = os.path.join(here, "RustTimeNoter", "tracker.exe")
+    if not os.path.isfile(src_tracker):
+        sys.exit("安装包里缺少 RustTimeNoter\\tracker.exe，请完整解压后再运行。")
+
+    rtn, bin_dir, tt_dir = _local_dirs()
+    os.makedirs(bin_dir, exist_ok=True)
+    os.makedirs(tt_dir, exist_ok=True)
+
+    dst_tracker = os.path.join(bin_dir, "tracker.exe")
+    print("[1/5] 停止正在运行的记录器 …")
+    if os.path.isfile(dst_tracker):
+        try:
+            subprocess.run([dst_tracker, "stop"], capture_output=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            try:
+                with open(dst_tracker, "rb+"):
+                    break
+            except OSError:
+                time.sleep(0.5)
+
+    print("[2/5] 复制程序到 LOCALAPPDATA …")
+    if getattr(sys, "frozen", False):
+        me = os.path.abspath(sys.executable)
+        target = os.path.join(tt_dir, "TimeTrace.exe")
+        if os.path.abspath(me).lower() != target.lower():
+            shutil.copy2(me, target)
+    else:
+        target = os.path.abspath(__file__)
+    with open(os.path.join(tt_dir, "launcher.txt"), "w", encoding="utf-8") as fp:
+        fp.write(target)
+
+    bak = os.path.join(bin_dir, "tracker.exe.orig")
+    if os.path.isfile(dst_tracker) and not os.path.isfile(bak):
+        try:
+            shutil.copy2(dst_tracker, bak)
+            print("      原版 tracker.exe 已备份为 tracker.exe.orig")
+        except OSError:
+            pass
+
+    # 记录器退出需要一点时间；被占用时等一会儿再复制
+    last_err = None
+    for _ in range(20):
+        try:
+            shutil.copy2(src_tracker, dst_tracker)
+            last_err = None
+            break
+        except OSError as exc:
+            last_err = exc
+            time.sleep(0.5)
+    if last_err is not None:
+        sys.exit("复制 tracker.exe 失败（文件被占用）：%s\n请先关掉记录器再试。" % last_err)
+
+    print("[3/5] 初始化配置 …")
+    try:
+        subprocess.run([dst_tracker, "config", "init"], capture_output=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    print("[4/5] 设置开机自启 …")
+    try:
+        subprocess.run([dst_tracker, "install", "autostart"], capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    print("[5/5] 启动记录器 …")
+    try:
+        flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                 | getattr(subprocess, "DETACHED_PROCESS", 0))
+        subprocess.Popen([dst_tracker, "run"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=flags)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    time.sleep(1.5)
+
+    print()
+    print("安装完成。右下角会出现 RustTimeNoter 图标，右键就是菜单：")
+    print("  打开时间线 / 查某个时刻 / 查某个软件 / 查 U 盘 / 查看某一天的使用记录 / 记录器状态")
+    print()
+    print("程序目录：%s" % tt_dir)
+    print("数据目录：%s" % rtn)
+    print("卸载：运行同目录的 卸载.bat（数据会保留）")
+
+
+def cmd_uninstall(args):
+    rtn, bin_dir, tt_dir = _local_dirs()
+    dst_tracker = os.path.join(bin_dir, "tracker.exe")
+    print("[1/3] 停止记录器并移除开机自启 …")
+    if os.path.isfile(dst_tracker):
+        for cmd in (["stop"], ["uninstall", "autostart"]):
+            try:
+                subprocess.run([dst_tracker] + cmd, capture_output=True, timeout=30)
+            except (OSError, subprocess.SubprocessError):
+                pass
+    print("[2/3] 恢复原版 tracker.exe（如果有备份）…")
+    bak = os.path.join(bin_dir, "tracker.exe.orig")
+    if os.path.isfile(bak):
+        shutil.copy2(bak, dst_tracker)
+    print("[3/3] 删除时迹程序 …")
+    shutil.rmtree(tt_dir, ignore_errors=True)
+    print()
+    print("已卸载。你的使用数据仍然保留在：%s" % rtn)
+    print("要彻底删除，手动删掉这个目录即可。")
 
 
 def main():
