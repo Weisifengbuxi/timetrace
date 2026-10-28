@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "1.7.0"
+VERSION = "2.1.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -2267,19 +2267,40 @@ def _ns(**kw):
 
 
 def interactive_menu():
+    tracker = None
     try:
-        find_tracker()
-    except SystemExit as exc:
-        print(exc)
-        input("按回车退出…")
+        tracker = find_tracker()
+    except SystemExit:
+        tracker = None
+
+    if tracker is None:
+        print()
+        print("=" * 58)
+        print(" 时迹 TimeTrace %s" % VERSION)
+        print("=" * 58)
+        print(" 这台电脑还没装 RustTimeNoter 记录器。")
+        print(" 时迹可以帮你把「记录器 + 时间线」一起装好（不需要管理员权限）。")
+        print()
+        try:
+            answer = input(" 现在安装？[Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if answer in ("", "y", "yes"):
+            try:
+                cmd_install(_ns())
+            except SystemExit as exc:
+                print(exc)
+            try:
+                input("\n按回车退出…")
+            except (EOFError, KeyboardInterrupt):
+                print()
         return
 
     text, installed = ensure_daemon()
     daemon, today = status_summary(text)
     if installed:
         print("已为 RustTimeNoter 开启开机自启（之后开机就自动记录）。")
-    if daemon != "运行中":
-        print("记录器没能启动，数据可能不是最新的。可以手动运行 tracker run 看看原因。")
 
     while True:
         text = _run_tracker(["status"])
@@ -2289,80 +2310,61 @@ def interactive_menu():
         print(" 时迹 TimeTrace %s" % VERSION)
         print(" 记录器：RustTimeNoter（%s）%s" % (daemon, ("   今天 " + today) if today else ""))
         print("=" * 58)
-        print(" 1) 打开时间线（所有日子、应用图标、U 盘记录）")
+        print(" 1) 打开时间线")
         print(" 2) 查某个时刻在用什么")
         print(" 3) 查某个软件什么时候被用过")
-        print(" 4) 查 U 盘：接入时刻 / 打开过的文件 / 下载")
-        print(" 5) 某个日期的文字流水")
+        print(" 4) 查 U 盘")
+        print(" 5) 查看某一天的使用记录")
         print(" 6) 记录器状态与数据位置")
+        print(" 7) 安装 / 修复（重新部署程序）")
+        print(" 8) 卸载（恢复原版 tracker.exe）")
         print(" 0) 退出")
         try:
-            choice = input("\n请选择 [0-6]: ").strip()
+            choice = input("\n请选择 [0-8]: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return
 
         if choice == "0":
             return
-        elif choice == "1":
-            try:
+        try:
+            if choice == "1":
                 cmd_html(_ns())
-            except SystemExit as exc:
-                print(exc)
-            except Exception as exc:  # noqa: BLE001
-                print("出错了：%s" % exc)
-        elif choice == "2":
-            try:
+            elif choice == "2":
                 cmd_at(_ns())
-            except SystemExit as exc:
-                print(exc)
-            except Exception as exc:  # noqa: BLE001
-                print("出错了：%s" % exc)
-        elif choice == "3":
-            try:
+            elif choice == "3":
                 cmd_app(_ns())
-            except SystemExit as exc:
-                print(exc)
-            except Exception as exc:  # noqa: BLE001
-                print("出错了：%s" % exc)
-        elif choice == "4":
-            try:
+            elif choice == "4":
                 cmd_events(_ns())
-            except SystemExit as exc:
-                print(exc)
-            except Exception as exc:  # noqa: BLE001
-                print("出错了：%s" % exc)
-        elif choice == "5":
-            try:
+            elif choice == "5":
                 day = input("日期（YYYY-MM-DD，直接回车 = 最近一天）：").strip()
-            except (EOFError, KeyboardInterrupt):
-                print()
-                return
-            try:
                 cmd_day(_ns(date=day or None))
-            except SystemExit as exc:
+            elif choice == "6":
+                print()
+                print(_run_tracker(["status"]).strip())
+                print("数据目录：%s" % os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustTimeNoter"))
+                print("图标缓存：%s" % ICON_CACHE_DIR)
+            elif choice == "7":
+                cmd_install(_ns())
+            elif choice == "8":
+                cmd_uninstall(_ns())
+                return
+            else:
+                continue
+        except SystemExit as exc:
+            if exc.code not in (None, 0):
                 print(exc)
-            except Exception as exc:  # noqa: BLE001
-                print("出错了：%s" % exc)
-        elif choice == "6":
+        except (EOFError, KeyboardInterrupt):
             print()
-            print(_run_tracker(["status"]).strip())
-            print("数据目录：%s" % os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustTimeNoter"))
-            print("图标缓存：%s" % ICON_CACHE_DIR)
-        else:
-            continue
+            return
+        except Exception as exc:  # noqa: BLE001
+            print("出错了：%s" % exc)
 
         try:
             input("\n按回车返回菜单…")
         except (EOFError, KeyboardInterrupt):
             print()
             return
-
-
-# --------------------------------------------------------------------------
-# 托盘图标（右下角）
-# --------------------------------------------------------------------------
-TRAY_RUN_VALUE = "TimeTraceTray"
 
 
 def hide_console():
@@ -2689,11 +2691,24 @@ def _local_dirs():
     return rtn, os.path.join(rtn, "bin"), tt
 
 
+def bundled_tracker():
+    """找打包进 exe 的改版 tracker.exe，其次找 exe 旁边的。"""
+    cands = []
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        cands.append(os.path.join(sys._MEIPASS, "RustTimeNoter", "tracker.exe"))
+    here = app_dir()
+    cands.append(os.path.join(here, "RustTimeNoter", "tracker.exe"))
+    cands.append(os.path.join(here, "vendor", "RustTimeNoter", "tracker.exe"))
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
 def cmd_install(args):
     """把时迹 + 改过的 RustTimeNoter 装到 %LOCALAPPDATA%，并设好开机自启。"""
-    here = app_dir()
-    src_tracker = os.path.join(here, "RustTimeNoter", "tracker.exe")
-    if not os.path.isfile(src_tracker):
+    src_tracker = bundled_tracker()
+    if not src_tracker:
         sys.exit("安装包里缺少 RustTimeNoter\\tracker.exe，请完整解压后再运行。")
 
     rtn, bin_dir, tt_dir = _local_dirs()
@@ -2776,7 +2791,7 @@ def cmd_install(args):
     print()
     print("程序目录：%s" % tt_dir)
     print("数据目录：%s" % rtn)
-    print("卸载：运行同目录的 卸载.bat（数据会保留）")
+    print("再次双击这个程序可以安装 / 修复；在菜单里选 8 可以卸载（数据会保留）。")
 
 
 def cmd_uninstall(args):
@@ -2848,3 +2863,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

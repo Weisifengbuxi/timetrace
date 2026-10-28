@@ -10,6 +10,7 @@ $common = @(
     "--name", "TimeTrace",
     "--distpath", "dist", "--workpath", "build\tmp", "--specpath", "build",
     "--icon", (Join-Path $PSScriptRoot "icon.ico"),
+    "--add-binary", ((Join-Path $PSScriptRoot "vendor\RustTimeNoter\tracker.exe") + ";RustTimeNoter"),
     "--hidden-import", "pystray._win32",
     "--exclude-module", "unittest",
     "--exclude-module", "pydoc",

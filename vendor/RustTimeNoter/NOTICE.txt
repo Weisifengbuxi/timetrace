@@ -1,0 +1,4 @@
+﻿这里放的是「改过的」RustTimeNoter（MIT）。
+上游：https://github.com/Weisifengbuxi/RustTimeNoter
+改动只有 src/daemon/tray.rs（托盘菜单）和 build.rs（嵌入 icon.ico），
+采集/加密/存储逻辑未改。构建方式见仓库 README 的「关于这个安装包」。
