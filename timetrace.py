@@ -28,13 +28,14 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unicodedata
 from collections import defaultdict
 from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "1.4.1"
+VERSION = "1.5.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -1898,7 +1899,7 @@ def cmd_html(args):
     dl = model.get("usbdl") or []
     if dl:
         print("下载到 U 盘：%d 条（来自浏览器下载记录）" % len(dl))
-    if not args.no_open:
+    if not args.no_open and not os.environ.get("TT_NO_OPEN"):
         try:
             os.startfile(out)  # noqa: S606  (Windows)
         except (AttributeError, OSError):
@@ -2089,6 +2090,7 @@ def build_parser():
     )
     p.add_argument("--version", action="version",
                    version="%(prog)s " + VERSION + "  (RustTimeNoter 时间线查看器)")
+    p.add_argument("--menu", action="store_true", help="打开交互菜单（不带参数时默认也会打开）")
     sub = p.add_subparsers(dest="cmd")
 
     def add_range(sp, default_days=None):
@@ -2151,6 +2153,195 @@ def setup_console():
         pass
 
 
+# --------------------------------------------------------------------------
+# 一体化入口：确保记录器在跑 + 交互菜单
+# --------------------------------------------------------------------------
+def _run_tracker(arg_list, timeout=25):
+    tracker = find_tracker()
+    try:
+        proc = subprocess.run([tracker] + arg_list, capture_output=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for enc in ("utf-8", "gbk"):
+        try:
+            return proc.stdout.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return proc.stdout.decode("utf-8", "replace")
+
+
+def autostart_installed():
+    if os.name != "nt":
+        return True
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run")
+        try:
+            count = winreg.QueryInfoKey(key)[1]
+            for i in range(count):
+                _name, value, _type = winreg.EnumValue(key, i)
+                low = str(value).lower()
+                if "tracker" in low or "rusttimenoter" in low:
+                    return True
+        finally:
+            winreg.CloseKey(key)
+    except OSError:
+        return True
+    return False
+
+
+def ensure_daemon():
+    """记录器没跑就拉起来；顺带把开机自启补上。返回 (状态文本, 是否刚装了自启)。"""
+    tracker = find_tracker()
+    text = _run_tracker(["status"])
+    if "running" not in text.lower():
+        try:
+            flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                     | getattr(subprocess, "DETACHED_PROCESS", 0))
+            subprocess.Popen([tracker, "run"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=flags)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        time.sleep(1.2)
+        text = _run_tracker(["status"])
+    installed = False
+    if not autostart_installed():
+        _run_tracker(["install", "autostart"])
+        installed = True
+    return text, installed
+
+
+def _fmt_span(text):
+    """把 '1h 37m 15s' 转成 '1 小时 37 分'。"""
+    m = re.match(r"(?:(\d+)h)?\s*(?:(\d+)m)?\s*(?:(\d+)s)?\s*$", text.strip())
+    if not m:
+        return text.strip()
+    h, mi, s = (int(x) if x else 0 for x in m.groups())
+    if h:
+        return "%d 小时 %d 分" % (h, mi)
+    if mi:
+        return "%d 分" % mi
+    return "%d 秒" % s
+
+
+def status_summary(text):
+    daemon = "运行中" if "running" in text.lower() else "未运行"
+    today = ""
+    for line in text.splitlines():
+        if line.lower().startswith("today records:"):
+            rest = " ".join(line.split(":", 1)[1].split())
+            m = re.match(r"(\d+)\s+total:\s*(.+)$", rest)
+            if m:
+                today = "%s 条 · %s" % (m.group(1), _fmt_span(m.group(2)))
+            else:
+                today = rest
+    return daemon, today
+
+
+def _ns(**kw):
+    base = dict(days=None, from_day=None, to_day=None, retention=RETENTION_DAYS,
+                no_prune=False, no_open=False, no_icons=False, no_events=False,
+                out=None, context=10, gap=300, date=None, time=None, name=None,
+                dry_run=False)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def interactive_menu():
+    try:
+        find_tracker()
+    except SystemExit as exc:
+        print(exc)
+        input("按回车退出…")
+        return
+
+    text, installed = ensure_daemon()
+    daemon, today = status_summary(text)
+    if installed:
+        print("已为 RustTimeNoter 开启开机自启（之后开机就自动记录）。")
+    if daemon != "运行中":
+        print("记录器没能启动，数据可能不是最新的。可以手动运行 tracker run 看看原因。")
+
+    while True:
+        text = _run_tracker(["status"])
+        daemon, today = status_summary(text)
+        print()
+        print("=" * 58)
+        print(" 时迹 TimeTrace %s" % VERSION)
+        print(" 记录器：RustTimeNoter（%s）%s" % (daemon, ("   今天 " + today) if today else ""))
+        print("=" * 58)
+        print(" 1) 打开时间线（所有日子、应用图标、U 盘记录）")
+        print(" 2) 查某个时刻在用什么")
+        print(" 3) 查某个软件什么时候被用过")
+        print(" 4) 查 U 盘：接入时刻 / 打开过的文件 / 下载")
+        print(" 5) 某个日期的文字流水")
+        print(" 6) 记录器状态与数据位置")
+        print(" 0) 退出")
+        try:
+            choice = input("\n请选择 [0-6]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+        if choice == "0":
+            return
+        elif choice == "1":
+            try:
+                cmd_html(_ns())
+            except SystemExit as exc:
+                print(exc)
+            except Exception as exc:  # noqa: BLE001
+                print("出错了：%s" % exc)
+        elif choice == "2":
+            try:
+                cmd_at(_ns())
+            except SystemExit as exc:
+                print(exc)
+            except Exception as exc:  # noqa: BLE001
+                print("出错了：%s" % exc)
+        elif choice == "3":
+            try:
+                cmd_app(_ns())
+            except SystemExit as exc:
+                print(exc)
+            except Exception as exc:  # noqa: BLE001
+                print("出错了：%s" % exc)
+        elif choice == "4":
+            try:
+                cmd_events(_ns())
+            except SystemExit as exc:
+                print(exc)
+            except Exception as exc:  # noqa: BLE001
+                print("出错了：%s" % exc)
+        elif choice == "5":
+            try:
+                day = input("日期（YYYY-MM-DD，直接回车 = 最近一天）：").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            try:
+                cmd_day(_ns(date=day or None))
+            except SystemExit as exc:
+                print(exc)
+            except Exception as exc:  # noqa: BLE001
+                print("出错了：%s" % exc)
+        elif choice == "6":
+            print()
+            print(_run_tracker(["status"]).strip())
+            print("数据目录：%s" % os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustTimeNoter"))
+            print("图标缓存：%s" % ICON_CACHE_DIR)
+        else:
+            continue
+
+        try:
+            input("\n按回车返回菜单…")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+
+
 def main():
     setup_console()
     if hasattr(sys.stdout, "reconfigure"):
@@ -2161,8 +2352,18 @@ def main():
             pass
     parser = build_parser()
     args = parser.parse_args()
+    if getattr(args, "menu", False):
+        interactive_menu()
+        return
     if not getattr(args, "cmd", None):
-        parser.print_help()
+        try:
+            tty = sys.stdin.isatty()
+        except (AttributeError, ValueError):
+            tty = False
+        if tty:
+            interactive_menu()
+        else:
+            parser.print_help()
         return
     try:
         args.func(args)
