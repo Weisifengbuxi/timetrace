@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "1.6.1"
+VERSION = "1.6.2"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -2451,6 +2451,20 @@ def _tray_post_start():
     tray_first_run_hint()
 
 
+def run_tracker_action(arg_list):
+    """直接调用 tracker 自己的命令（原版报表 / 停止等）。"""
+    try:
+        tracker = find_tracker()
+    except SystemExit:
+        return
+    try:
+        subprocess.Popen([tracker] + arg_list, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def tray_base_command():
     if getattr(sys, "frozen", False):
         return [sys.executable]
@@ -2515,7 +2529,41 @@ def set_tray_autostart(enabled):
         winreg.CloseKey(key)
 
 
+def tracker_icon_png():
+    """取 RustTimeNoter 自己的图标（缓存成 PNG），让托盘图标跟它长得一样。"""
+    cache_dir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace")
+    cache = os.path.join(cache_dir, "tracker-icon.png")
+    if os.path.isfile(cache) and os.path.getsize(cache) > 0:
+        return cache
+    try:
+        tracker = find_tracker()
+        os.makedirs(cache_dir, exist_ok=True)
+        script = (
+            "Add-Type -AssemblyName System.Drawing\n"
+            "$ico = [System.Drawing.Icon]::ExtractAssociatedIcon('%s')\n"
+            "$ico.ToBitmap().Save('%s', [System.Drawing.Imaging.ImageFormat]::Png)\n"
+            % (tracker.replace("'", "''"), cache.replace("'", "''"))
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+             base64.b64encode(script.encode("utf-16-le")).decode("ascii")],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError, SystemExit):
+        return None
+    return cache if os.path.isfile(cache) and os.path.getsize(cache) > 0 else None
+
+
 def make_tray_image():
+    png = tracker_icon_png()
+    if png:
+        try:
+            from PIL import Image
+            return Image.open(png).convert("RGBA")
+        except Exception:
+            pass
     from PIL import Image, ImageDraw
     size = 64
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -2565,6 +2613,27 @@ def run_tray():
     def do_status(icon=None, item=None):
         spawn_engine(["--pause", "status"], console=True)
 
+    def do_tracker_view(icon=None, item=None):
+        run_tracker_action(["view"])
+
+    def do_data_dir(icon=None, item=None):
+        try:
+            os.startfile(os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustTimeNoter"))
+        except (OSError, AttributeError):
+            pass
+
+    def do_stop(icon=None, item=None):
+        try:
+            import ctypes
+            answer = ctypes.windll.user32.MessageBoxW(
+                None,
+                "停止后不再记录使用情况，直到下次启动。\n\n确定要停止记录器吗？",
+                "RustTimeNoter", 0x04 | 0x20)  # MB_YESNO | MB_ICONQUESTION
+            if answer == 6:  # IDYES
+                run_tracker_action(["stop"])
+        except Exception:
+            pass
+
     def toggle_autostart(icon=None, item=None):
         state["autostart"] = not state["autostart"]
         if not set_tray_autostart(state["autostart"]):
@@ -2585,10 +2654,14 @@ def run_tray():
         MenuItem("某个日期的文字流水", do_day),
         MenuItem("记录器状态与数据位置", do_status),
         Menu.SEPARATOR,
+        MenuItem("RustTimeNoter 原版报表", do_tracker_view),
+        MenuItem("打开数据目录", do_data_dir),
+        MenuItem("停止记录器", do_stop),
+        Menu.SEPARATOR,
         MenuItem("开机自动启动", toggle_autostart, checked=lambda item: state["autostart"]),
         MenuItem("退出", do_quit),
     )
-    icon = Icon("TimeTrace", make_tray_image(), "时迹 TimeTrace", menu)
+    icon = Icon("TimeTrace", make_tray_image(), "RustTimeNoter · 时迹", menu)
     import threading
     threading.Thread(target=_tray_post_start, daemon=True).start()
     icon.run()

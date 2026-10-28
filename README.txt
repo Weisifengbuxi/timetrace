@@ -1,4 +1,4 @@
-时迹 TimeTrace v1.6.1
+时迹 TimeTrace v1.6.2
 =====================
 
 给 RustTimeNoter 装一条时间线：看清「几点几分在用什么软件」。
