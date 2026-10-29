@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.4.0"
+VERSION = "2.4.1"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -745,6 +745,28 @@ def lifecycle_events(days, life):
     return out
 
 
+def lifecycle_interruption_count(days, life):
+    """区间内「记录中断」的次数（一次停止 → 一次恢复算一次）。"""
+    rng = _model_range(days)
+    if rng is None:
+        return 0
+    lo, hi = rng
+    n = 0
+    open_dt = None
+    for r in life:
+        if r["kind"] in ("stopped", "missing"):
+            if open_dt is None:
+                open_dt = r["dt"]
+        elif r["kind"] in ("started", "restored"):
+            if open_dt is not None:
+                if lo <= open_dt < hi:
+                    n += 1
+                open_dt = None
+    if open_dt is not None and lo <= open_dt < hi:
+        n += 1
+    return n
+
+
 def lifecycle_spans(days, life):
     rng = _model_range(days)
     if rng is None:
@@ -811,6 +833,7 @@ def build_model(days, with_icons=False):
     life = read_lifecycle()
     model["lifecycle"] = lifecycle_events(days, life)
     model["lifeSpans"] = lifecycle_spans(days, life)
+    model["lifeInterruptions"] = lifecycle_interruption_count(days, life)
     return model
 
 
@@ -975,11 +998,11 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
       <h2 style="margin:0">U 盘记录</h2>
       <div class="row" style="gap:8px">
         <span id="usbhint" class="hint" style="color:var(--muted);font-size:12px"></span>
-        <button class="foldbtn" data-target="usbbody">收起</button>
+        <button class="foldbtn" data-target="usbbody">展开</button>
       </div>
     </div>
 
-    <div id="usbbody">
+    <div id="usbbody" style="display:none">
     <div id="usbconnwrap">
       <h3 style="font-size:13px;margin:14px 0 6px;font-weight:600">接入时刻</h3>
       <table class="apptable">
@@ -1058,10 +1081,10 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
       <h2 style="margin:0">记录器状态</h2>
       <div class="row" style="gap:8px">
         <span id="lifehint" class="hint" style="color:var(--muted);font-size:12px"></span>
-        <button class="foldbtn" data-target="lifebody">收起</button>
+        <button class="foldbtn" data-target="lifebody">展开</button>
       </div>
     </div>
-    <div id="lifebody">
+    <div id="lifebody" style="display:none">
       <table class="apptable">
         <thead><tr>
           <th style="width:150px">时间</th>
@@ -1298,7 +1321,8 @@ function renderLifecycle(){
              : '<span class="lifeok">' + lifeLabel(e.kind) + '</span>') + '</td></tr>';
   }
   $("#lifetbody").innerHTML = rows;
-  $("#lifehint").textContent = "共 " + list.length + " 条";
+  var ni = M.lifeInterruptions || 0;
+  $("#lifehint").textContent = (ni ? ("中断 " + ni + " 次") : "没有中断") + " · 来自时迹监控";
   $("#lifecard").style.display = "";
 }
 
@@ -1785,8 +1809,8 @@ document.getElementById("orderBtn").addEventListener("click", function(){
   renderDays();
 });
 
-/* U 盘记录 / 记录器状态 的展开收起 */
-Array.prototype.forEach.call(document.querySelectorAll(".foldbtn"), function(btn){
+/* U 盘记录 / 记录器状态 的展开收起（只绑带 data-target 的按钮） */
+Array.prototype.forEach.call(document.querySelectorAll(".foldbtn[data-target]"), function(btn){
   btn.addEventListener("click", function(){
     var el = document.getElementById(btn.getAttribute("data-target"));
     if (!el) return;
@@ -3613,6 +3637,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
