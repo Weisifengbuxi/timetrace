@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.2.0"
+VERSION = "2.2.1"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -1020,7 +1020,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     <div class="note" style="margin-top:10px">
       记录器被<b>手动停止</b>、退出或<b>程序被删除</b>时，这里会留一条记录，
       并在当天色带上用<b style="color:#e5484d">红色竖线</b>标出来；停止期间的时间段会整段染红。
-      检查靠一个每分钟运行一次的小任务（任务计划里的 TimeTraceWatch）。
+      检查靠一个常驻的小进程（登录自启，每分钟看一眼，几乎不占 CPU）。
     </div>
   </div>
 
@@ -2345,7 +2345,8 @@ def build_parser():
     uni = sub.add_parser("uninstall", help="卸载时迹，恢复原版 tracker.exe")
     uni.set_defaults(func=cmd_uninstall)
 
-    wt = sub.add_parser("watch", help="检查记录器是否被停止或删除（供每分钟的计划任务调用）")
+    wt = sub.add_parser("watch", help="检查记录器是否被停止或删除")
+    wt.add_argument("--loop", action="store_true", help="常驻，每分钟检查一次")
     wt.set_defaults(func=cmd_watch)
 
     pr = sub.add_parser("prune", help="删除超过保留期的日志分片（默认 30 天）")
@@ -3023,8 +3024,8 @@ def cmd_uninstall(args):
     print("要彻底删除，手动删掉这个目录即可。")
 
 
-def cmd_watch(args):
-    """每分钟跑一次：记录器「停止 / 被删除 / 恢复」这类事件写到 lifecycle.log。"""
+def watch_once():
+    """检查一次：记录器「停止 / 被删除 / 恢复」这类事件写到 lifecycle.log。"""
     tracker = None
     try:
         tracker = find_tracker()
@@ -3065,35 +3066,102 @@ def cmd_watch(args):
         pass
 
 
-def watch_task_command():
+def watch_pid_file():
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "watch.pid")
+
+
+def watch_loop():
+    """常驻：每分钟检查一次。比每分钟启动一次 exe 便宜得多。"""
+    hide_console()
+    if single_instance("TimeTraceWatch_Loop") is None:
+        return
+    try:
+        os.makedirs(os.path.dirname(watch_pid_file()), exist_ok=True)
+        with open(watch_pid_file(), "w", encoding="ascii") as fp:
+            fp.write(str(os.getpid()))
+    except OSError:
+        pass
+    while True:
+        try:
+            watch_once()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(60)
+
+
+def cmd_watch(args):
+    if getattr(args, "loop", False):
+        watch_loop()
+        return
+    watch_once()
+
+
+def watch_launch_command():
     installed = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "TimeTrace.exe")
     if os.path.isfile(installed):
-        return '"%s" watch' % installed
+        return '"%s" watch --loop' % installed
     if getattr(sys, "frozen", False):
-        return '"%s" watch' % os.path.abspath(sys.executable)
-    return '"%s" "%s" watch' % (sys.executable, os.path.abspath(__file__))
+        return '"%s" watch --loop' % os.path.abspath(sys.executable)
+    return '"%s" "%s" watch --loop' % (sys.executable, os.path.abspath(__file__))
 
 
-def install_watch_task():
-    if os.name != "nt":
-        return False
+def start_watch_loop():
+    cmd = watch_launch_command()
     try:
-        subprocess.run(["schtasks", "/create", "/tn", "TimeTraceWatch",
-                        "/sc", "minute", "/mo", "1", "/f",
-                        "/tr", watch_task_command()],
-                       capture_output=True, timeout=30,
-                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.Popen(cmd, shell=False, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                        | getattr(subprocess, "DETACHED_PROCESS", 0)))
         return True
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def install_watch_task():
+    """登录自启一个常驻的 watch --loop（不用计划任务，避免每分钟启动 exe）。"""
+    if os.name != "nt":
+        return False
+    try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
+                             winreg.KEY_SET_VALUE)
+        try:
+            winreg.SetValueEx(key, "TimeTraceWatch", 0, winreg.REG_SZ, watch_launch_command())
+        finally:
+            winreg.CloseKey(key)
+    except OSError:
+        return False
+    start_watch_loop()
+    return True
 
 
 def remove_watch_task():
     if os.name != "nt":
         return
     try:
+        import winreg
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                             r"Software\Microsoft\Windows\CurrentVersion\Run", 0,
+                             winreg.KEY_SET_VALUE)
+        try:
+            winreg.DeleteValue(key, "TimeTraceWatch")
+        except OSError:
+            pass
+        finally:
+            winreg.CloseKey(key)
+    except OSError:
+        pass
+    try:
+        with open(watch_pid_file(), encoding="ascii") as fp:
+            pid = int(fp.read().strip())
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=15,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
         subprocess.run(["schtasks", "/delete", "/tn", "TimeTraceWatch", "/f"],
-                       capture_output=True, timeout=30,
+                       capture_output=True, timeout=15,
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.SubprocessError):
         pass
@@ -3147,6 +3215,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
