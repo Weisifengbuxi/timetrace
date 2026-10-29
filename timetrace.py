@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.5.0"
+VERSION = "2.6.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -981,7 +981,6 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
 
   <div class="nav" id="nav">
     <a href="index.html" data-nav="index">总览</a>
-    <a href="days.html" data-nav="days">每日</a>
     <a href="detail.html" data-nav="detail">明细</a>
   </div>
 
@@ -1004,16 +1003,39 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     </div>
   </div>
 
+  <div class="card" id="lifecard" data-view="index" style="display:none">
+    <div class="row between">
+      <h2 style="margin:0">记录器状态</h2>
+      <div class="row" style="gap:8px">
+        <span id="lifehint" class="hint" style="color:var(--muted);font-size:12px"></span>
+        <button class="foldbtn" data-target="lifebody">展开</button>
+      </div>
+    </div>
+    <div id="lifebody" style="display:none">
+      <table class="apptable">
+        <thead><tr>
+          <th style="width:150px">时间</th>
+          <th style="width:140px">事件</th>
+        </tr></thead>
+        <tbody id="lifetbody"></tbody>
+      </table>
+      <div class="note" style="margin-top:10px">
+        记录器被<b>手动停止</b>、退出或<b>程序被删除</b>时，这里会留一条记录，
+        并在当天色带上用<b style="color:#b42318">红色斜纹</b>标出中断的那段区间（正常记录不标注）。
+      </div>
+    </div>
+  </div>
+
   <div class="card" id="usbcard" data-view="detail" style="display:none">
     <div class="row between">
       <h2 style="margin:0">U 盘记录</h2>
       <div class="row" style="gap:8px">
         <span id="usbhint" class="hint" style="color:var(--muted);font-size:12px"></span>
-        <button class="foldbtn" data-target="usbbody">展开</button>
+        <button class="foldbtn" data-target="usbbody">收起</button>
       </div>
     </div>
 
-    <div id="usbbody" style="display:none">
+    <div id="usbbody">
     <div id="usbconnwrap">
       <h3 style="font-size:13px;margin:14px 0 6px;font-weight:600">接入时刻</h3>
       <table class="apptable">
@@ -1085,32 +1107,10 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     <div class="note" style="margin-top:8px">点一行 = 只看这个应用，并跳到它最近一次使用的那一段。</div>
   </div>
 
-  <div id="days" data-view="days"></div>
+  <div id="days" data-view="index"></div>
 
-  <div class="card" id="lifecard" data-view="detail" style="display:none">
-    <div class="row between">
-      <h2 style="margin:0">记录器状态</h2>
-      <div class="row" style="gap:8px">
-        <span id="lifehint" class="hint" style="color:var(--muted);font-size:12px"></span>
-        <button class="foldbtn" data-target="lifebody">展开</button>
-      </div>
-    </div>
-    <div id="lifebody" style="display:none">
-      <table class="apptable">
-        <thead><tr>
-          <th style="width:150px">时间</th>
-          <th style="width:140px">事件</th>
-        </tr></thead>
-        <tbody id="lifetbody"></tbody>
-      </table>
-      <div class="note" style="margin-top:10px">
-        记录器被<b>手动停止</b>、退出或<b>程序被删除</b>时，这里会留一条记录，
-        并在当天色带上用<b style="color:#b42318">红色斜纹</b>标出中断的那段区间（正常记录不标注）。
-      </div>
-    </div>
-  </div>
 
-  <div class="card note" data-view="index days">
+  <div class="card note" data-view="index">
     <b>怎么读：</b>色带上每一块是一段会话，鼠标移上去可看应用与起止时间；
     色带下面那排小格子是<b>每小时的主力应用</b>（点格子可只看它）；
     连续使用超过十几分钟的时段，色带上会直接贴出应用图标。<br>
@@ -1212,7 +1212,7 @@ function renderOverview(){
   var di = "";
   for (var k = M.days.length - 1; k >= 0; k--){
     var d = M.days[k];
-    di += '<a href="' + (VIEW === "index" ? "days.html" : "") + '#d' + d.date + '">' + d.date.slice(5) + " 周" + d.weekday
+    di += '<a href="#d' + d.date + '">' + d.date.slice(5) + " 周" + d.weekday
         + ' <span style="color:#98a2b3">' + durTxt(d.stats.activity) + "</span></a>";
   }
   $("#daysIndex").innerHTML = di;
@@ -1807,7 +1807,15 @@ document.getElementById("fold").addEventListener("change", function(){
 document.getElementById("expandAll").addEventListener("click", function(){ setAllFold(false); });
 document.getElementById("collapseAll").addEventListener("click", function(){ setAllFold(true); });
 
-/* 主题切换 */
+/* 主题：默认跟随系统（prefers-color-scheme） */
+(function(){
+  try {
+    var mq = window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)");
+    if (mq && mq.matches){ state.dark = true; document.body.classList.add("dark"); }
+  } catch (e) {}
+  var tb = document.getElementById("theme");
+  if (tb) tb.textContent = state.dark ? "☀ 亮色" : "🌙 暗色";
+})();
 document.getElementById("theme").addEventListener("click", function(){
   state.dark = !state.dark;
   document.body.classList.toggle("dark", state.dark);
@@ -2194,11 +2202,16 @@ def cmd_html(args):
         os.makedirs(outdir, exist_ok=True)
         for name, view, title in (
             ("index.html", "index", "时迹 · 总览"),
-            ("days.html", "days", "时迹 · 每日"),
             ("detail.html", "detail", "时迹 · 明细"),
         ):
             with open(os.path.join(outdir, name), "w", encoding="utf-8") as fp:
                 fp.write(render_html(model, view, title))
+        stale = os.path.join(outdir, "days.html")
+        if os.path.isfile(stale):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
         out = os.path.join(outdir, "index.html")
 
     print("时间线已生成：%s" % out)
@@ -3667,6 +3680,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
