@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 时迹 TimeTrace — RustTimeNoter 的时间线查看器
@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.3.1"
+VERSION = "2.3.2"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -1022,7 +1022,6 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     <div class="note" style="margin-top:10px">
       记录器被<b>手动停止</b>、退出或<b>程序被删除</b>时，这里会留一条记录，
       并在当天色带上用<b style="color:#b42318">红色斜纹</b>标出中断的那段区间（正常记录不标注）。
-      检查靠一个常驻的小进程（登录自启，等记录器进程退出，几乎不占 CPU）。
     </div>
   </div>
 
@@ -3555,6 +3554,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
