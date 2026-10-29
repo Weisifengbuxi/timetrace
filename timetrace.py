@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 时迹 TimeTrace — RustTimeNoter 的时间线查看器
@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.2.2"
+VERSION = "2.3.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -2466,6 +2466,97 @@ def _ns(**kw):
     return argparse.Namespace(**base)
 
 
+def tray_cfg_path():
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "tray.cfg")
+
+
+def tray_enabled():
+    try:
+        with open(tray_cfg_path(), encoding="utf-8") as fp:
+            return fp.read().strip().lower() != "off"
+    except OSError:
+        return True
+
+
+def set_tray_enabled(enabled):
+    try:
+        os.makedirs(os.path.dirname(tray_cfg_path()), exist_ok=True)
+        with open(tray_cfg_path(), "w", encoding="utf-8") as fp:
+            fp.write("on" if enabled else "off")
+        return True
+    except OSError:
+        return False
+
+
+def choose_tray():
+    """安装时问一次：托盘里显不显示图标。不是终端就默认显示。"""
+    print()
+    print("  右下角托盘图标（RustTimeNoter 那个）要显示吗？")
+    print("    1) 显示（默认）—— 右键就能打开时间线、停止记录")
+    print("    2) 不显示 —— 托盘里完全看不到它")
+    print("       代价：以后要停止记录、看报表，只能在「时迹」这个程序里操作")
+    print("       适合：希望它一直安静跑着、不想让人在托盘里发现的人")
+    try:
+        answer = input("  选择 [1/2，回车=1]：").strip()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer == "2":
+        set_tray_enabled(False)
+        print("  已选择：不显示托盘图标")
+    else:
+        set_tray_enabled(True)
+        print("  已选择：显示托盘图标")
+
+
+def restart_tracker():
+    try:
+        exe = find_tracker()
+    except SystemExit:
+        return False
+    try:
+        subprocess.run([exe, "stop"], capture_output=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    time.sleep(2)
+    try:
+        subprocess.Popen([exe], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL,
+                         creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                        | getattr(subprocess, "DETACHED_PROCESS", 0)))
+    except (OSError, subprocess.SubprocessError):
+        return False
+    time.sleep(1)
+    return True
+
+
+def recorder_running():
+    return "running" in _run_tracker(["status"]).lower()
+
+
+def create_desktop_shortcut():
+    if os.name != "nt":
+        return False
+    exe = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "TimeTrace.exe")
+    if not os.path.isfile(exe):
+        return False
+    script = (
+        "$desk=[Environment]::GetFolderPath('Desktop');"
+        "$p=Join-Path $desk '时迹.lnk';"
+        "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($p);"
+        "$s.TargetPath='%s';$s.WorkingDirectory='%s';$s.IconLocation='%s';$s.Save()"
+        % (exe, os.path.dirname(exe), exe)
+    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+             base64.b64encode(script.encode("utf-16-le")).decode("ascii")],
+            capture_output=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def interactive_menu():
     tracker = None
     try:
@@ -2518,9 +2609,11 @@ def interactive_menu():
         print(" 6) 记录器状态与数据位置")
         print(" 7) 安装 / 修复（重新部署程序）")
         print(" 8) 卸载（恢复原版 tracker.exe）")
+        print(" 9) 托盘图标：当前%s（点一下切换）" % ("显示" if tray_enabled() else "不显示"))
+        print(" 10) %s记录器" % ("停止" if recorder_running() else "启动"))
         print(" 0) 退出")
         try:
-            choice = input("\n请选择 [0-8]: ").strip()
+            choice = input("\n请选择 [0-10]: ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
             return
@@ -2549,6 +2642,28 @@ def interactive_menu():
             elif choice == "8":
                 cmd_uninstall(_ns())
                 return
+            elif choice == "9":
+                now_on = not tray_enabled()
+                set_tray_enabled(now_on)
+                restart_tracker()
+                print("托盘图标已设为：%s（记录器已重启）" % ("显示" if now_on else "不显示"))
+            elif choice == "10":
+                try:
+                    exe = find_tracker()
+                except SystemExit as exc:
+                    print(exc)
+                else:
+                    if recorder_running():
+                        append_lifecycle("stopped", "在时迹里手动停止")
+                        subprocess.run([exe, "stop"], capture_output=True, timeout=15)
+                        print("已停止记录。要恢复：再选一次 10。")
+                    else:
+                        subprocess.Popen([exe], stdin=subprocess.DEVNULL,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                         creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                                        | getattr(subprocess, "DETACHED_PROCESS", 0)))
+                        print("已启动记录。")
+                    time.sleep(1)
             else:
                 continue
         except SystemExit as exc:
@@ -2931,11 +3046,27 @@ def cmd_install(args):
                 time.sleep(0.5)
 
     print("[2/5] 复制程序到 LOCALAPPDATA …")
+    # 常驻检查进程正占用着已安装的 exe，先停掉再覆盖
+    try:
+        stop_watch_loop()
+    except Exception:  # noqa: BLE001
+        pass
+    time.sleep(0.5)
     if getattr(sys, "frozen", False):
         me = os.path.abspath(sys.executable)
         target = os.path.join(tt_dir, "TimeTrace.exe")
         if os.path.abspath(me).lower() != target.lower():
-            shutil.copy2(me, target)
+            last = None
+            for _ in range(20):
+                try:
+                    shutil.copy2(me, target)
+                    last = None
+                    break
+                except OSError as exc:
+                    last = exc
+                    time.sleep(0.5)
+            if last is not None:
+                sys.exit("复制 TimeTrace.exe 失败（文件被占用）：%s" % last)
     else:
         target = os.path.abspath(__file__)
     with open(os.path.join(tt_dir, "launcher.txt"), "w", encoding="utf-8") as fp:
@@ -2962,19 +3093,22 @@ def cmd_install(args):
     if last_err is not None:
         sys.exit("复制 tracker.exe 失败（文件被占用）：%s\n请先关掉记录器再试。" % last_err)
 
-    print("[3/5] 初始化配置 …")
+    print("[3/6] 初始化配置 …")
     try:
         subprocess.run([dst_tracker, "config", "init"], capture_output=True, timeout=20)
     except (OSError, subprocess.SubprocessError):
         pass
 
-    print("[4/5] 设置开机自启 …")
+    print("[4/6] 托盘图标 …")
+    choose_tray()
+
+    print("[5/6] 设置开机自启 …")
     try:
         subprocess.run([dst_tracker, "install", "autostart"], capture_output=True, timeout=30)
     except (OSError, subprocess.SubprocessError):
         pass
 
-    print("[5/5] 启动记录器 …")
+    print("[6/6] 启动记录器 …")
     try:
         flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
                  | getattr(subprocess, "DETACHED_PROCESS", 0))
@@ -2987,14 +3121,19 @@ def cmd_install(args):
 
     append_lifecycle("installed", "安装 / 更新完成")
     install_watch_task()
+    create_desktop_shortcut()
     try:
         cmd_watch(_ns())
     except Exception:
         pass
 
     print()
-    print("安装完成。右下角会出现 RustTimeNoter 图标，右键就是菜单：")
-    print("  打开时间线 / 查某个时刻 / 查某个软件 / 查 U 盘 / 查看某一天的使用记录 / 记录器状态")
+    if tray_enabled():
+        print("安装完成。右下角会出现 RustTimeNoter 图标，右键就是菜单：")
+        print("  打开时间线 / 查某个时刻 / 查某个软件 / 查 U 盘 / 查看某一天的使用记录 / 记录器状态")
+    else:
+        print("安装完成。托盘里不会显示图标（按你的选择）。")
+        print("  要看报表或停止记录：双击桌面上的「时迹」")
     print()
     print("程序目录：%s" % tt_dir)
     print("数据目录：%s" % rtn)
@@ -3117,8 +3256,56 @@ def watch_pid_file():
     return os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "watch.pid")
 
 
+def _k32():
+    import ctypes
+    from ctypes import wintypes
+    if not hasattr(_k32, "_dll"):
+        dll = ctypes.WinDLL("kernel32", use_last_error=True)
+        dll.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        dll.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        dll.OpenProcess.restype = wintypes.HANDLE
+        dll.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        dll.WaitForSingleObject.restype = wintypes.DWORD
+        dll.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        dll.CloseHandle.argtypes = [wintypes.HANDLE]
+        _k32._dll = dll
+    return _k32._dll
+
+
+def find_tracker_pid():
+    """枚举进程找 tracker.exe（只读快照，不启动任何程序）。"""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    k32 = _k32()
+    snap = k32.CreateToolhelp32Snapshot(0x00000002, 0)
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return 0
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if not k32.Process32FirstW(snap, ctypes.byref(entry)):
+            return 0
+        while True:
+            if entry.szExeFile.lower() == "tracker.exe":
+                return int(entry.th32ProcessID)
+            if not k32.Process32NextW(snap, ctypes.byref(entry)):
+                return 0
+    finally:
+        k32.CloseHandle(snap)
+
+
 def watch_loop():
-    """常驻：每分钟检查一次。比每分钟启动一次 exe 便宜得多。"""
+    """常驻：等 tracker 进程句柄退出（内核事件），不轮询、不启动子进程。"""
     hide_console()
     if single_instance("TimeTraceWatch_Loop") is None:
         return
@@ -3128,12 +3315,88 @@ def watch_loop():
             fp.write(str(os.getpid()))
     except OSError:
         pass
+
+    k32 = _k32()
+    SYNCHRONIZE = 0x00100000
+    WAIT_OBJECT_0 = 0
+    WAIT_TIMEOUT = 258
+    boot = boot_id()
+    state_path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "watch.state")
+    was_running = None
+    handle = None
+    pid = 0
+
+    # 启动时先补一条「开机自启」（重启后即使一直没停过也要有标记）
+    try:
+        prev = {}
+        try:
+            with open(state_path, encoding="utf-8") as fp:
+                prev = json.load(fp)
+        except (OSError, ValueError):
+            prev = {}
+        if prev.get("running") is not None and prev.get("boot") != boot:
+            append_lifecycle("started", "开机自启")
+            was_running = None
+        _write_state(state_path, True, True, boot)
+    except Exception:  # noqa: BLE001
+        pass
+
     while True:
         try:
-            watch_once()
+            cur = find_tracker_pid()
+            tracker = None
+            try:
+                tracker = find_tracker()
+            except SystemExit:
+                tracker = None
+            present = tracker is not None
+
+            if cur:
+                if handle is None or cur != pid:
+                    if handle:
+                        k32.CloseHandle(handle)
+                    handle = k32.OpenProcess(SYNCHRONIZE, False, cur)
+                    pid = cur
+                    if was_running is False:
+                        append_lifecycle("started", "记录器开始运行")
+                    was_running = True
+                    _write_state(state_path, present, True, boot)
+                if handle:
+                    rc = k32.WaitForSingleObject(handle, 20000)
+                    if rc == WAIT_OBJECT_0:
+                        append_lifecycle("stopped", "记录器停止运行（手动退出或被结束）")
+                        k32.CloseHandle(handle)
+                        handle = None
+                        pid = 0
+                        was_running = False
+                        _write_state(state_path, present, False, boot)
+                        if not present:
+                            append_lifecycle("missing", "记录器文件不见了（被删除或移走）")
+                    # 超时就继续等，不做任何额外工作
+                else:
+                    time.sleep(5)
+            else:
+                if was_running is not False:
+                    append_lifecycle("stopped", "记录器停止运行（手动退出或被结束）")
+                    was_running = False
+                    _write_state(state_path, present, False, boot)
+                    if not present:
+                        append_lifecycle("missing", "记录器文件不见了（被删除或移走）")
+                time.sleep(5)
+                if present:
+                    # 文件回来了但进程没起：等用户/自启再拉起
+                    _write_state(state_path, present, False, boot)
         except Exception:  # noqa: BLE001
-            pass
-        time.sleep(15)
+            time.sleep(5)
+
+
+def _write_state(path, present, running, boot):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fp:
+            json.dump({"present": present, "running": running, "boot": boot}, fp)
+    except OSError:
+        pass
 
 
 def cmd_watch(args):
@@ -3277,6 +3540,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
