@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.4.1"
+VERSION = "2.5.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -882,6 +882,11 @@ input:focus{outline:2px solid rgba(47,109,237,.22);border-color:var(--accent)}
 .days-index{display:flex;flex-wrap:wrap;gap:6px}
 .days-index a{font-size:12.5px;padding:3px 9px;border:1px solid var(--line);border-radius:999px;text-decoration:none;color:var(--ink);background:#fff}
 .days-index a:hover{background:#f2f4f7}
+.nav{display:flex;gap:8px;margin:0 0 12px 2px}
+.nav a{font-size:13px;padding:5px 14px;border:1px solid var(--line);border-radius:999px;text-decoration:none;color:var(--ink);background:#fff}
+.nav a.on{background:var(--accent);border-color:var(--accent);color:#fff}
+body.dark .nav a{background:#1d2430}
+body.dark .nav a.on{background:var(--accent);color:#fff}
 .apptable{margin-top:12px}
 .approw{cursor:pointer}
 .approw:hover td{background:#f8fafc}
@@ -974,7 +979,13 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     </div>
   </header>
 
-  <div class="card">
+  <div class="nav" id="nav">
+    <a href="index.html" data-nav="index">总览</a>
+    <a href="days.html" data-nav="days">每日</a>
+    <a href="detail.html" data-nav="detail">明细</a>
+  </div>
+
+  <div class="card" data-view="index">
     <div class="stats" id="stats"></div>
     <div class="row between" style="margin-top:16px">
       <h2 style="margin:0">全部应用（点击可只看它）</h2>
@@ -993,7 +1004,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     </div>
   </div>
 
-  <div class="card" id="usbcard" style="display:none">
+  <div class="card" id="usbcard" data-view="detail" style="display:none">
     <div class="row between">
       <h2 style="margin:0">U 盘记录</h2>
       <div class="row" style="gap:8px">
@@ -1054,7 +1065,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     </div>
   </div>
 
-  <div class="card">
+  <div class="card" data-view="detail">
     <div class="row between">
       <h2 style="margin:0">查应用：它是什么时候被用过的</h2>
       <input type="text" id="appq" placeholder="进程名或名字，如 pallas、微信" style="width:300px">
@@ -1074,9 +1085,9 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     <div class="note" style="margin-top:8px">点一行 = 只看这个应用，并跳到它最近一次使用的那一段。</div>
   </div>
 
-  <div id="days"></div>
+  <div id="days" data-view="days"></div>
 
-  <div class="card" id="lifecard" style="display:none">
+  <div class="card" id="lifecard" data-view="detail" style="display:none">
     <div class="row between">
       <h2 style="margin:0">记录器状态</h2>
       <div class="row" style="gap:8px">
@@ -1099,7 +1110,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     </div>
   </div>
 
-  <div class="card note">
+  <div class="card note" data-view="index days">
     <b>怎么读：</b>色带上每一块是一段会话，鼠标移上去可看应用与起止时间；
     色带下面那排小格子是<b>每小时的主力应用</b>（点格子可只看它）；
     连续使用超过十几分钟的时段，色带上会直接贴出应用图标。<br>
@@ -1116,6 +1127,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
 (function(){
 "use strict";
 var M = JSON.parse(document.getElementById("data").textContent);
+var VIEW = "__VIEW__";
 var DAY = 86400;
 var APPS = Object.keys(M.colorMap);
 var IDX = {};
@@ -1200,7 +1212,7 @@ function renderOverview(){
   var di = "";
   for (var k = M.days.length - 1; k >= 0; k--){
     var d = M.days[k];
-    di += '<a href="#d' + d.date + '">' + d.date.slice(5) + " 周" + d.weekday
+    di += '<a href="' + (VIEW === "index" ? "days.html" : "") + '#d' + d.date + '">' + d.date.slice(5) + " 周" + d.weekday
         + ' <span style="color:#98a2b3">' + durTxt(d.stats.activity) + "</span></a>";
   }
   $("#daysIndex").innerHTML = di;
@@ -1847,6 +1859,16 @@ indexUsb();
 renderOverview();
 renderLifecycle();
 renderUsb();
+(function(){
+  Array.prototype.forEach.call(document.querySelectorAll("[data-view]"), function(el){
+    var v = el.getAttribute("data-view").split(" ");
+    if (v.indexOf(VIEW) < 0) el.style.display = "none";
+  });
+  var links = document.querySelectorAll("#nav a");
+  for (var i = 0; i < links.length; i++){
+    if (links[i].getAttribute("data-nav") === VIEW) links[i].className = "on";
+  }
+})();
 renderAppTable();
 renderDays();
 })();
@@ -1855,13 +1877,14 @@ renderDays();
 </html>
 """
 
-def render_html(model, title=APP_TITLE):
+def render_html(model, view="index", title=APP_TITLE):
     data = json.dumps(model, ensure_ascii=False, separators=(",", ":"))
     data = data.replace("</", "<\\/")
     return (
         HTML_TEMPLATE
         .replace("__TITLE__", title)
         .replace("__GEN__", model["generated"])
+        .replace("__VIEW__", view)
         .replace("__DATA__", data)
     )
 
@@ -2162,14 +2185,21 @@ def cmd_html(args):
         model["usb"] = load_usb_events(ef, et)
         model["usbfiles"] = load_recent_usb_files()
         model["usbdl"] = load_usb_downloads()
-    html = render_html(model)
-
-    out = args.out
-    if not out:
-        out = os.path.join(tempfile.gettempdir(), "时迹_时间线.html")
-    out = os.path.abspath(out)
-    with open(out, "w", encoding="utf-8") as fp:
-        fp.write(html)
+    if args.out:
+        out = os.path.abspath(args.out)
+        with open(out, "w", encoding="utf-8") as fp:
+            fp.write(render_html(model, "index"))
+    else:
+        outdir = os.path.join(tempfile.gettempdir(), "时迹_时间线")
+        os.makedirs(outdir, exist_ok=True)
+        for name, view, title in (
+            ("index.html", "index", "时迹 · 总览"),
+            ("days.html", "days", "时迹 · 每日"),
+            ("detail.html", "detail", "时迹 · 明细"),
+        ):
+            with open(os.path.join(outdir, name), "w", encoding="utf-8") as fp:
+                fp.write(render_html(model, view, title))
+        out = os.path.join(outdir, "index.html")
 
     print("时间线已生成：%s" % out)
     print("覆盖 %s 至 %s，共 %d 天、%d 条会话。"
@@ -3637,6 +3667,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
