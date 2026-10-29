@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 时迹 TimeTrace — RustTimeNoter 的时间线查看器
@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -811,7 +811,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
       <div class="sub" id="sub"></div>
     </div>
     <div class="row">
-      <input type="text" id="q" placeholder="跳到 14:30 或 2026-10-26 14:30">
+      <input type="text" id="q" placeholder="搜索 14:30 或 2026-10-26 14:30">
       <button id="go">定位</button>
       <button id="save" title="把当前这份时间线存成 HTML 文件">保存本页</button>
     </div>
@@ -886,7 +886,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
       接入时刻来自 Windows 设备日志（Kernel-PnP）；「打开过的文件」来自「最近使用」记录；
       「下载到 U 盘的文件」来自 Edge / Chrome 的下载记录。
       能看出<b>从 U 盘打开过什么</b>、<b>浏览器下载到 U 盘了什么</b>；
-      资源管理器里的拖拽、复制粘贴、删除，两个方向 Windows 都不记录，这里也看不到。
+      资源管理器里的拖拽、复制粘贴、删除，两个方向 Windows 都不记录，因此无法看到。
       不写入设备序列号，也不读取文件内容。
     </div>
   </div>
@@ -908,7 +908,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
       </tr></thead>
       <tbody id="apptbody"></tbody>
     </table>
-    <div class="note" style="margin-top:8px">点一行 = 只看这个应用，并跳到它最近一次使用的那一段（再点取消）。</div>
+    <div class="note" style="margin-top:8px">点一行 = 只看这个应用，并跳到它最近一次使用的那一段。</div>
   </div>
 
   <div id="days"></div>
@@ -919,10 +919,9 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     连续使用超过十几分钟的时段，色带上会直接贴出应用图标。<br>
     点<b>日期那一行</b>可以展开/收起当天的完整会话表（上面的开关决定默认是否收起）。
     灰色斜纹 = 有记录但未归属到应用的空档；空白 = 完全没有记录（关机 / 睡眠 / 记录器未运行）。
-    相邻的同一应用记录（间隔 ≤ 3 秒）已合并成一段。<br>
-    <b>保存：</b>右上角“保存本页”可以把当前这份报告存成独立的 HTML 文件（图标和数据都在里面，请自己保管）。
+    相邻的同一应用记录（间隔 ≤ 3 秒）已合并成一段。
   </div>
-  <footer>由 <b>时迹 TimeTrace</b> 生成 · 数据来自 <b>RustTimeNoter</b> · __GEN__ · 数据仍在本地，不上传</footer>
+  <footer>由 <b>时迹 TimeTrace</b> 生成 · 数据来自 <b>RustTimeNoter</b> · __GEN__ · 原作者：RustTimeNoter</footer>
 </div>
 <div class="tip" id="tip"></div>
 <script id="data" type="application/json">__DATA__</script>
@@ -992,8 +991,7 @@ function totalAppList(){
 function renderOverview(){
   var t = M.total;
   $("#sub").innerHTML = "共 " + M.days.length + " 天 · 总记录 " + durTxt(t.activity)
-    + " · " + M.days[0].date + " ~ " + M.days[M.days.length-1].date
-    + " · 保留期内的全部记录";
+    + " · " + M.days[0].date + " ~ " + M.days[M.days.length-1].date;
   var items = [
     ["天数", M.days.length + " 天"],
     ["总记录时长", durTxt(t.activity)],
@@ -1203,6 +1201,10 @@ function renderUsb(){
     $("#usbfilestbody").innerHTML = fh;
     $("#usbfileshint").textContent = "共 " + files.length + " 条";
     $("#usbfileswrap").style.display = "";
+  } else {
+    $("#usbfilestbody").innerHTML = '<tr><td colspan="3" class="hint">没有查到（Windows 只记录「打开过」的文件，复制粘贴到 U 盘不算）</td></tr>';
+    $("#usbfileshint").textContent = "";
+    $("#usbfileswrap").style.display = "";
   }
 
   if (dls.length){
@@ -1216,6 +1218,10 @@ function renderUsb(){
     }
     $("#usbdltbody").innerHTML = dh;
     $("#usbdlhint").textContent = "共 " + dls.length + " 条";
+    $("#usbdlwrap").style.display = "";
+  } else {
+    $("#usbdltbody").innerHTML = '<tr><td colspan="4" class="hint">没有查到（只统计浏览器直接下载到 U 盘的记录）</td></tr>';
+    $("#usbdlhint").textContent = "";
     $("#usbdlwrap").style.display = "";
   }
 
@@ -2863,4 +2869,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
