@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.6.0"
+VERSION = "2.6.1"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -921,6 +921,11 @@ body.dark tbody tr:hover{background:#1b212a}
 body.dark .daysub .sep{color:#3a4350}
 body.dark .axis{color:#6b7684}
 body.dark .card.note{background:#141a21}
+body.dark .approw.active td{background:#1b2b43}
+body.dark .hcell{background:#1b212a}
+body.dark .hcell.hoverable:hover{background:#232b36}
+body.dark .ribbon{background:#1b212a}
+body.dark button:hover,body.dark .lg:hover,body.dark .days-index a:hover{background:#232b36}
 body.dark .lifebad{background:#3a1d1d;color:#ff9b9b}
 body.dark .lifeok{background:#12301f;color:#7ee2a8}
 .usbmark::after{content:"";position:absolute;top:2px;left:-4px;width:6px;height:6px;border-radius:50%;background:#0f766e}
@@ -3680,6 +3685,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
