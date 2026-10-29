@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 时迹 TimeTrace — RustTimeNoter 的时间线查看器
@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.2.1"
+VERSION = "2.2.2"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -683,11 +683,11 @@ def lifecycle_path():
     return os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustTimeNoter", "lifecycle.log")
 
 
-def append_lifecycle(kind, note=""):
+def append_lifecycle(kind, note="", ts=None):
     try:
         path = lifecycle_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        rec = {"ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "kind": kind, "note": note}
+        rec = {"ts": (ts or datetime.now()).strftime("%Y-%m-%d %H:%M:%S"), "kind": kind, "note": note}
         with open(path, "a", encoding="utf-8") as fp:
             fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
         return True
@@ -3024,8 +3024,46 @@ def cmd_uninstall(args):
     print("要彻底删除，手动删掉这个目录即可。")
 
 
+def boot_id():
+    """本机这次开机的时刻（unix 秒）；用来识别「重启了」。"""
+    try:
+        import ctypes
+        ms = ctypes.windll.kernel32.GetTickCount64()
+        return int(time.time() - ms / 1000)
+    except Exception:
+        return 0
+
+
+def last_record_end(today):
+    """今天最后一条记录的结束时刻；用来把「停止」精确到秒。"""
+    try:
+        out = os.path.join(tempfile.gettempdir(), "tt_watch_export.json")
+        tracker = find_tracker()
+        subprocess.run([tracker, "export", "--format", "json", "--out", out],
+                       capture_output=True, timeout=25,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        with open(out, encoding="utf-8") as fp:
+            recs = json.load(fp)
+        best = None
+        for r in recs:
+            if r.get("date") != today:
+                continue
+            try:
+                start = datetime.strptime(r.get("start_time", ""), "%H:%M:%S")
+            except ValueError:
+                continue
+            end = start + timedelta(seconds=int(r.get("duration_secs") or 0))
+            if best is None or end > best:
+                best = end
+        if best is None:
+            return None
+        return datetime.combine(date.fromisoformat(today), best.time())
+    except (OSError, ValueError, subprocess.SubprocessError, SystemExit):
+        return None
+
+
 def watch_once():
-    """检查一次：记录器「停止 / 被删除 / 恢复」这类事件写到 lifecycle.log。"""
+    """检查一次：记录器「开机 / 启动 / 停止 / 被删除」这类事件写到 lifecycle.log。"""
     tracker = None
     try:
         tracker = find_tracker()
@@ -3045,23 +3083,32 @@ def watch_once():
     except (OSError, ValueError):
         prev = {}
 
+    now = datetime.now()
+    boot = boot_id()
     events = []
     if prev:
         if prev.get("present") and not present:
-            events.append(("missing", "记录器文件不见了（被删除或移走）"))
+            events.append(("missing", "记录器文件不见了（被删除或移走）", None))
         if not prev.get("present") and present:
-            events.append(("restored", "记录器文件回来了"))
+            events.append(("restored", "记录器文件回来了", None))
         if prev.get("running") and not running:
-            events.append(("stopped", "记录器停止运行（手动退出或被结束）"))
+            ts = now
+            end = last_record_end(now.strftime("%Y-%m-%d"))
+            if end is not None and timedelta(0) <= (now - end) <= timedelta(minutes=3):
+                ts = end
+            events.append(("stopped", "记录器停止运行（手动退出或被结束）", ts))
         if not prev.get("running") and running:
-            events.append(("started", "记录器开始运行"))
-    for kind, note in events:
-        append_lifecycle(kind, note)
+            events.append(("started", "记录器开始运行", None))
+        # 重启过（即使之前也在运行），补一条「开机启动」
+        if boot and prev.get("boot") and prev.get("boot") != boot and running:
+            events.append(("started", "开机自启", None))
+    for kind, note, ts in events:
+        append_lifecycle(kind, note, ts)
 
     try:
         os.makedirs(os.path.dirname(state_path), exist_ok=True)
         with open(state_path, "w", encoding="utf-8") as fp:
-            json.dump({"present": present, "running": running}, fp)
+            json.dump({"present": present, "running": running, "boot": boot}, fp)
     except OSError:
         pass
 
@@ -3086,7 +3133,7 @@ def watch_loop():
             watch_once()
         except Exception:  # noqa: BLE001
             pass
-        time.sleep(60)
+        time.sleep(15)
 
 
 def cmd_watch(args):
@@ -3117,10 +3164,25 @@ def start_watch_loop():
         return False
 
 
+def stop_watch_loop():
+    try:
+        with open(watch_pid_file(), encoding="ascii") as fp:
+            pid = int(fp.read().strip())
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=15,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        os.remove(watch_pid_file())
+    except OSError:
+        pass
+
+
 def install_watch_task():
     """登录自启一个常驻的 watch --loop（不用计划任务，避免每分钟启动 exe）。"""
     if os.name != "nt":
         return False
+    stop_watch_loop()
     try:
         import winreg
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
@@ -3215,6 +3277,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
