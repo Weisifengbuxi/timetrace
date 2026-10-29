@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.3.2"
+VERSION = "2.4.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -878,6 +878,23 @@ input:focus{outline:2px solid rgba(47,109,237,.22);border-color:var(--accent)}
   box-shadow:inset 0 0 0 1px #b42318}
 .lifebad{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:#fee4e2;color:#b42318}
 .lifeok{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:#e7f6ec;color:#087443}
+.lifelegend{display:inline-block;width:16px;height:10px;margin-left:6px;vertical-align:middle;border:1px solid #b42318;border-radius:2px;background:repeating-linear-gradient(45deg,#e5484d 0 2px,#ffc9c9 2px 4px)}
+.foldbtn{font-size:12px;padding:3px 10px;border-radius:999px}
+body.dark{--bg:#0e1116;--card:#161b22;--ink:#e6e9ef;--muted:#98a2b3;--line:#2a313b;--soft:#1b212a;--hit:#3b3520}
+body.dark .lg{background:#1d2430;color:var(--ink)}
+body.dark button,body.dark input[type=text]{background:#1d2430;color:var(--ink)}
+body.dark .days-index a{background:#1b212a}
+body.dark .row button,body.dark .foldbtn{background:#1d2430;color:var(--ink);border-color:var(--line)}
+body.dark .tip{background:#1d2430;color:var(--ink);border-color:var(--line)}
+body.dark .segbase{background:#1b212a}
+body.dark td{border-bottom-color:#232a34}
+body.dark td.t{color:#aab3c0}
+body.dark tbody tr:hover{background:#1b212a}
+body.dark .daysub .sep{color:#3a4350}
+body.dark .axis{color:#6b7684}
+body.dark .card.note{background:#141a21}
+body.dark .lifebad{background:#3a1d1d;color:#ff9b9b}
+body.dark .lifeok{background:#12301f;color:#7ee2a8}
 .usbmark::after{content:"";position:absolute;top:2px;left:-4px;width:6px;height:6px;border-radius:50%;background:#0f766e}
 .usbpath{max-width:640px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#344054}
 .hcell .hbar{position:absolute;left:0;right:0;bottom:0;height:3px;opacity:.9}
@@ -930,6 +947,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
       <input type="text" id="q" placeholder="搜索 14:30 或 2026-10-26 14:30">
       <button id="go">定位</button>
       <button id="save" title="把当前这份时间线存成 HTML 文件">保存本页</button>
+      <button id="theme" title="切换亮色 / 暗色">🌙 暗色</button>
     </div>
   </header>
 
@@ -948,15 +966,20 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
       <label class="switch"><input type="checkbox" id="fold"> 每天默认收起表格（点日期那一行展开）</label>
       <button id="expandAll" style="font-size:12px;padding:4px 10px;border-radius:999px">全部展开</button>
       <button id="collapseAll" style="font-size:12px;padding:4px 10px;border-radius:999px">全部收起</button>
+      <button id="orderBtn" style="font-size:12px;padding:4px 10px;border-radius:999px">日期：新→旧</button>
     </div>
   </div>
 
   <div class="card" id="usbcard" style="display:none">
     <div class="row between">
       <h2 style="margin:0">U 盘记录</h2>
-      <span id="usbhint" class="hint" style="color:var(--muted);font-size:12px"></span>
+      <div class="row" style="gap:8px">
+        <span id="usbhint" class="hint" style="color:var(--muted);font-size:12px"></span>
+        <button class="foldbtn" data-target="usbbody">收起</button>
+      </div>
     </div>
 
+    <div id="usbbody">
     <div id="usbconnwrap">
       <h3 style="font-size:13px;margin:14px 0 6px;font-weight:600">接入时刻</h3>
       <table class="apptable">
@@ -1005,23 +1028,6 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
       资源管理器里的拖拽、复制粘贴、删除，两个方向 Windows 都不记录，因此无法看到。
       不写入设备序列号，也不读取文件内容。
     </div>
-  </div>
-
-  <div class="card" id="lifecard" style="display:none">
-    <div class="row between">
-      <h2 style="margin:0">记录器状态</h2>
-      <span id="lifehint" class="hint" style="color:var(--muted);font-size:12px"></span>
-    </div>
-    <table class="apptable">
-      <thead><tr>
-        <th style="width:150px">时间</th>
-        <th style="width:140px">事件</th>
-      </tr></thead>
-      <tbody id="lifetbody"></tbody>
-    </table>
-    <div class="note" style="margin-top:10px">
-      记录器被<b>手动停止</b>、退出或<b>程序被删除</b>时，这里会留一条记录，
-      并在当天色带上用<b style="color:#b42318">红色斜纹</b>标出中断的那段区间（正常记录不标注）。
     </div>
   </div>
 
@@ -1047,6 +1053,29 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
 
   <div id="days"></div>
 
+  <div class="card" id="lifecard" style="display:none">
+    <div class="row between">
+      <h2 style="margin:0">记录器状态</h2>
+      <div class="row" style="gap:8px">
+        <span id="lifehint" class="hint" style="color:var(--muted);font-size:12px"></span>
+        <button class="foldbtn" data-target="lifebody">收起</button>
+      </div>
+    </div>
+    <div id="lifebody">
+      <table class="apptable">
+        <thead><tr>
+          <th style="width:150px">时间</th>
+          <th style="width:140px">事件</th>
+        </tr></thead>
+        <tbody id="lifetbody"></tbody>
+      </table>
+      <div class="note" style="margin-top:10px">
+        记录器被<b>手动停止</b>、退出或<b>程序被删除</b>时，这里会留一条记录，
+        并在当天色带上用<b style="color:#b42318">红色斜纹</b>标出中断的那段区间（正常记录不标注）。
+      </div>
+    </div>
+  </div>
+
   <div class="card note">
     <b>怎么读：</b>色带上每一块是一段会话，鼠标移上去可看应用与起止时间；
     色带下面那排小格子是<b>每小时的主力应用</b>（点格子可只看它）；
@@ -1068,7 +1097,7 @@ var DAY = 86400;
 var APPS = Object.keys(M.colorMap);
 var IDX = {};
 for (var ai = 0; ai < APPS.length; ai++) IDX[APPS[ai]] = ai;
-var state = { filter: null, fold: true };
+var state = { filter: null, fold: true, order: 1, dark: false };
 try { state.fold = localStorage.getItem("rtn.fold") !== "0"; } catch (e) {}
 var $ = function(s){ return document.querySelector(s); };
 
@@ -1334,7 +1363,8 @@ function dayHtml(d){
   var spList = LIFE_SPANS[d.date];
   if (spList && spList.length){
     sub = sub.replace('</div>',
-      '<span class="sep">·</span><b style="color:#b42318">记录中断 ' + spList.length + ' 次</b></div>');
+      '<span class="sep">·</span><b style="color:#b42318">记录中断 ' + spList.length + ' 次</b>'
+      + '<span class="lifelegend" title="红色斜纹 = 记录器被停止 / 删除的那段区间"></span></div>');
   }
 
   var chips = "";
@@ -1437,8 +1467,12 @@ function indexUsb(){
 
 function renderDays(){
   var h = "";
-  // 新的日期放前面：打开就先看到今天，往下翻是更早的日子
-  for (var i = M.days.length - 1; i >= 0; i--) h += dayHtml(M.days[i]);
+  // 默认「大到小」（新的日期在前），点按钮切换
+  if (state.order === 1){
+    for (var i = M.days.length - 1; i >= 0; i--) h += dayHtml(M.days[i]);
+  } else {
+    for (var j = 0; j < M.days.length; j++) h += dayHtml(M.days[j]);
+  }
   $("#days").innerHTML = h;
   applyFold();
   decorateRibbons();
@@ -1736,6 +1770,31 @@ document.getElementById("fold").addEventListener("change", function(){
 });
 document.getElementById("expandAll").addEventListener("click", function(){ setAllFold(false); });
 document.getElementById("collapseAll").addEventListener("click", function(){ setAllFold(true); });
+
+/* 主题切换 */
+document.getElementById("theme").addEventListener("click", function(){
+  state.dark = !state.dark;
+  document.body.classList.toggle("dark", state.dark);
+  this.textContent = state.dark ? "☀ 亮色" : "🌙 暗色";
+});
+
+/* 日期排序：默认大到小 */
+document.getElementById("orderBtn").addEventListener("click", function(){
+  state.order = state.order === 1 ? -1 : 1;
+  this.textContent = state.order === 1 ? "日期：新→旧" : "日期：旧→新";
+  renderDays();
+});
+
+/* U 盘记录 / 记录器状态 的展开收起 */
+Array.prototype.forEach.call(document.querySelectorAll(".foldbtn"), function(btn){
+  btn.addEventListener("click", function(){
+    var el = document.getElementById(btn.getAttribute("data-target"));
+    if (!el) return;
+    var hidden = el.style.display === "none";
+    el.style.display = hidden ? "" : "none";
+    btn.textContent = hidden ? "收起" : "展开";
+  });
+});
 document.getElementById("save").addEventListener("click", savePage);
 document.getElementById("appq").addEventListener("input", function(){
   var q = this.value.trim().toLowerCase();
@@ -3554,6 +3613,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
