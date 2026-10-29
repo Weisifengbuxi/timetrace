@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.1.2"
+VERSION = "2.2.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -676,6 +676,112 @@ def app_stats(days):
     return out
 
 
+# --------------------------------------------------------------------------
+# 记录器状态（启动 / 停止 / 被删除）
+# --------------------------------------------------------------------------
+def lifecycle_path():
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustTimeNoter", "lifecycle.log")
+
+
+def append_lifecycle(kind, note=""):
+    try:
+        path = lifecycle_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        rec = {"ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "kind": kind, "note": note}
+        with open(path, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def read_lifecycle():
+    out = []
+    path = lifecycle_path()
+    if not os.path.isfile(path):
+        return out
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fp:
+            for line in fp:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                try:
+                    dt = datetime.strptime(str(rec.get("ts", "")), "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    continue
+                out.append({"dt": dt, "kind": str(rec.get("kind", "")), "note": str(rec.get("note", ""))})
+    except OSError:
+        return out
+    out.sort(key=lambda r: r["dt"])
+    return out
+
+
+def _model_range(days):
+    if not days:
+        return None
+    lo = datetime.combine(date.fromisoformat(days[0]["date"]), dtime(0, 0))
+    hi = datetime.combine(date.fromisoformat(days[-1]["date"]) + timedelta(days=1), dtime(0, 0))
+    return lo, hi
+
+
+def lifecycle_events(days, life):
+    rng = _model_range(days)
+    if rng is None:
+        return []
+    lo, hi = rng
+    out = []
+    for r in life:
+        if lo <= r["dt"] < hi:
+            out.append({
+                "date": r["dt"].strftime("%Y-%m-%d"),
+                "t": r["dt"].hour * 3600 + r["dt"].minute * 60 + r["dt"].second,
+                "kind": r["kind"],
+            })
+    return out
+
+
+def lifecycle_spans(days, life):
+    rng = _model_range(days)
+    if rng is None:
+        return []
+    lo, hi = rng
+    raw = []
+    open_dt = None
+    for r in life:
+        if r["kind"] in ("stopped", "missing"):
+            if open_dt is None:
+                open_dt = r["dt"]
+        elif r["kind"] in ("started", "restored"):
+            if open_dt is not None:
+                raw.append((open_dt, r["dt"]))
+                open_dt = None
+    if open_dt is not None:
+        raw.append((open_dt, hi))
+    out = []
+    for a, b in raw:
+        s = max(a, lo)
+        e = min(b or hi, hi)
+        if e <= s:
+            continue
+        cur = s
+        while cur < e:
+            nxt = datetime.combine(cur.date() + timedelta(days=1), dtime(0, 0))
+            seg_end = min(nxt, e)
+            base = datetime.combine(cur.date(), dtime(0, 0))
+            out.append({
+                "date": cur.strftime("%Y-%m-%d"),
+                "t": int((cur - base).total_seconds()),
+                "d": int((seg_end - cur).total_seconds()),
+            })
+            cur = seg_end
+    return out
+
+
 def build_model(days, with_icons=False):
     apps = rank_apps(days)
     color_map = {}
@@ -702,6 +808,9 @@ def build_model(days, with_icons=False):
     }
     if with_icons:
         model["icons"] = load_icons(apps)
+    life = read_lifecycle()
+    model["lifecycle"] = lifecycle_events(days, life)
+    model["lifeSpans"] = lifecycle_spans(days, life)
     return model
 
 
@@ -762,6 +871,11 @@ input:focus{outline:2px solid rgba(47,109,237,.22);border-color:var(--accent)}
 .hcell .ico{width:14px;height:14px}
 .hcell .sw{width:12px;height:12px}
 .usbmark{position:absolute;top:0;bottom:0;width:0;border-left:2px dashed #0f766e;opacity:.85;z-index:2;pointer-events:auto}
+.lifemark{position:absolute;top:0;bottom:0;width:0;border-left:2px solid #e5484d;opacity:.9;z-index:4;pointer-events:auto}
+.lifemark.ok{border-left-color:#30a46c}
+.lifespan{position:absolute;top:0;bottom:0;background:rgba(229,72,77,.16);z-index:1;pointer-events:none}
+.lifebad{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:#fee4e2;color:#b42318}
+.lifeok{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:#e7f6ec;color:#087443}
 .usbmark::after{content:"";position:absolute;top:2px;left:-4px;width:6px;height:6px;border-radius:50%;background:#0f766e}
 .usbpath{max-width:640px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#344054}
 .hcell .hbar{position:absolute;left:0;right:0;bottom:0;height:3px;opacity:.9}
@@ -888,6 +1002,25 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
       能看出<b>从 U 盘打开过什么</b>、<b>浏览器下载到 U 盘了什么</b>；
       资源管理器里的拖拽、复制粘贴、删除，两个方向 Windows 都不记录，因此无法看到。
       不写入设备序列号，也不读取文件内容。
+    </div>
+  </div>
+
+  <div class="card" id="lifecard" style="display:none">
+    <div class="row between">
+      <h2 style="margin:0">记录器状态</h2>
+      <span id="lifehint" class="hint" style="color:var(--muted);font-size:12px"></span>
+    </div>
+    <table class="apptable">
+      <thead><tr>
+        <th style="width:150px">时间</th>
+        <th style="width:140px">事件</th>
+      </tr></thead>
+      <tbody id="lifetbody"></tbody>
+    </table>
+    <div class="note" style="margin-top:10px">
+      记录器被<b>手动停止</b>、退出或<b>程序被删除</b>时，这里会留一条记录，
+      并在当天色带上用<b style="color:#e5484d">红色竖线</b>标出来；停止期间的时间段会整段染红。
+      检查靠一个每分钟运行一次的小任务（任务计划里的 TimeTraceWatch）。
     </div>
   </div>
 
@@ -1075,7 +1208,7 @@ function ribbonHtml(d){
     segs += '<div class="seg gap" style="left:' + pct(s.t/DAY) + '%;width:calc(' + pct(s.d/DAY) + '% + 0.7px)"></div>';
   }
   return '<div class="ribbon" data-day="' + d.date + '"><div class="segbase" style="position:absolute;inset:0"></div>'
-       + segs + usbMarksHtml(d) + '<div class="cursorline"></div></div>';
+       + segs + usbMarksHtml(d) + lifeSpansHtml(d) + lifeMarksHtml(d) + '<div class="cursorline"></div></div>';
 }
 
 /* U 盘接入在色带上的标记 */
@@ -1089,6 +1222,51 @@ function usbMarksHtml(d){
        + '%" title="U 盘接入 ' + hms(list[i].t) + (list[i].letter ? "（" + list[i].letter + ":）" : "") + '"></div>';
   }
   return h;
+}
+
+/* 记录器状态：启动 / 停止 / 被删除 */
+var LIFE_BY_DATE = {};
+var LIFE_SPANS = {};
+function lifeLabel(kind){
+  return {installed: "安装", started: "记录器启动", stopped: "记录器停止",
+          missing: "记录器被删除", restored: "记录器恢复"}[kind] || kind;
+}
+function lifeMarksHtml(d){
+  var list = LIFE_BY_DATE[d.date];
+  if (!list) return "";
+  var h = "";
+  for (var i = 0; i < list.length; i++){
+    var e = list[i];
+    var bad = (e.kind === "stopped" || e.kind === "missing");
+    h += '<div class="lifemark' + (bad ? "" : " ok") + '" style="left:' + (e.t / DAY * 100).toFixed(3)
+       + '%" title="' + lifeLabel(e.kind) + " " + hms(e.t) + '"></div>';
+  }
+  return h;
+}
+function lifeSpansHtml(d){
+  var list = LIFE_SPANS[d.date];
+  if (!list) return "";
+  var h = "";
+  for (var i = 0; i < list.length; i++){
+    h += '<div class="lifespan" style="left:' + (list[i].t / DAY * 100).toFixed(3)
+       + '%;width:calc(' + (list[i].d / DAY * 100).toFixed(3) + '% + 0.5px)" title="这段时间记录器没有运行"></div>';
+  }
+  return h;
+}
+function renderLifecycle(){
+  var list = M.lifecycle || [];
+  if (!list.length) return;
+  var rows = "";
+  for (var i = 0; i < list.length; i++){
+    var e = list[i];
+    var bad = (e.kind === "stopped" || e.kind === "missing");
+    rows += '<tr><td class="t">' + e.date.slice(5) + " " + hms(e.t) + '</td><td>'
+      + (bad ? '<span class="lifebad">' + lifeLabel(e.kind) + '</span>'
+             : '<span class="lifeok">' + lifeLabel(e.kind) + '</span>') + '</td></tr>';
+  }
+  $("#lifetbody").innerHTML = rows;
+  $("#lifehint").textContent = "共 " + list.length + " 条";
+  $("#lifecard").style.display = "";
 }
 
 function axisHtml(){
@@ -1563,7 +1741,19 @@ document.getElementById("appq").addEventListener("input", function(){
 });
 
 indexUsb();
+(function(){
+  var lc = M.lifecycle || [], i, e;
+  for (i = 0; i < lc.length; i++){
+    e = lc[i];
+    (LIFE_BY_DATE[e.date] = LIFE_BY_DATE[e.date] || []).push(e);
+  }
+  var sp = M.lifeSpans || [];
+  for (i = 0; i < sp.length; i++){
+    (LIFE_SPANS[sp[i].date] = LIFE_SPANS[sp[i].date] || []).push(sp[i]);
+  }
+})();
 renderOverview();
+renderLifecycle();
 renderUsb();
 renderAppTable();
 renderDays();
@@ -2154,6 +2344,9 @@ def build_parser():
 
     uni = sub.add_parser("uninstall", help="卸载时迹，恢复原版 tracker.exe")
     uni.set_defaults(func=cmd_uninstall)
+
+    wt = sub.add_parser("watch", help="检查记录器是否被停止或删除（供每分钟的计划任务调用）")
+    wt.set_defaults(func=cmd_watch)
 
     pr = sub.add_parser("prune", help="删除超过保留期的日志分片（默认 30 天）")
     pr.add_argument("--days", type=int, default=RETENTION_DAYS, help="保留天数（默认 30）")
@@ -2791,6 +2984,13 @@ def cmd_install(args):
         pass
     time.sleep(1.5)
 
+    append_lifecycle("installed", "安装 / 更新完成")
+    install_watch_task()
+    try:
+        cmd_watch(_ns())
+    except Exception:
+        pass
+
     print()
     print("安装完成。右下角会出现 RustTimeNoter 图标，右键就是菜单：")
     print("  打开时间线 / 查某个时刻 / 查某个软件 / 查 U 盘 / 查看某一天的使用记录 / 记录器状态")
@@ -2804,6 +3004,8 @@ def cmd_uninstall(args):
     rtn, bin_dir, tt_dir = _local_dirs()
     dst_tracker = os.path.join(bin_dir, "tracker.exe")
     print("[1/3] 停止记录器并移除开机自启 …")
+    append_lifecycle("uninstalled", "卸载时迹")
+    remove_watch_task()
     if os.path.isfile(dst_tracker):
         for cmd in (["stop"], ["uninstall", "autostart"]):
             try:
@@ -2819,6 +3021,82 @@ def cmd_uninstall(args):
     print()
     print("已卸载。你的使用数据仍然保留在：%s" % rtn)
     print("要彻底删除，手动删掉这个目录即可。")
+
+
+def cmd_watch(args):
+    """每分钟跑一次：记录器「停止 / 被删除 / 恢复」这类事件写到 lifecycle.log。"""
+    tracker = None
+    try:
+        tracker = find_tracker()
+    except SystemExit:
+        tracker = None
+    present = tracker is not None
+    running = False
+    if present:
+        text = _run_tracker(["status"])
+        running = "running" in text.lower()
+
+    state_path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "watch.state")
+    prev = {}
+    try:
+        with open(state_path, encoding="utf-8") as fp:
+            prev = json.load(fp)
+    except (OSError, ValueError):
+        prev = {}
+
+    events = []
+    if prev:
+        if prev.get("present") and not present:
+            events.append(("missing", "记录器文件不见了（被删除或移走）"))
+        if not prev.get("present") and present:
+            events.append(("restored", "记录器文件回来了"))
+        if prev.get("running") and not running:
+            events.append(("stopped", "记录器停止运行（手动退出或被结束）"))
+        if not prev.get("running") and running:
+            events.append(("started", "记录器开始运行"))
+    for kind, note in events:
+        append_lifecycle(kind, note)
+
+    try:
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        with open(state_path, "w", encoding="utf-8") as fp:
+            json.dump({"present": present, "running": running}, fp)
+    except OSError:
+        pass
+
+
+def watch_task_command():
+    installed = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "TimeTrace.exe")
+    if os.path.isfile(installed):
+        return '"%s" watch' % installed
+    if getattr(sys, "frozen", False):
+        return '"%s" watch' % os.path.abspath(sys.executable)
+    return '"%s" "%s" watch' % (sys.executable, os.path.abspath(__file__))
+
+
+def install_watch_task():
+    if os.name != "nt":
+        return False
+    try:
+        subprocess.run(["schtasks", "/create", "/tn", "TimeTraceWatch",
+                        "/sc", "minute", "/mo", "1", "/f",
+                        "/tr", watch_task_command()],
+                       capture_output=True, timeout=30,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def remove_watch_task():
+    if os.name != "nt":
+        return
+    try:
+        subprocess.run(["schtasks", "/delete", "/tn", "TimeTraceWatch", "/f"],
+                       capture_output=True, timeout=30,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def main():
@@ -2869,6 +3147,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
