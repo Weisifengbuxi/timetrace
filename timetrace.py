@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 时迹 TimeTrace — RustTimeNoter 的时间线查看器
@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.1.1"
+VERSION = "2.1.2"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -921,7 +921,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     灰色斜纹 = 有记录但未归属到应用的空档；空白 = 完全没有记录（关机 / 睡眠 / 记录器未运行）。
     相邻的同一应用记录（间隔 ≤ 3 秒）已合并成一段。
   </div>
-  <footer>由 <b>时迹 TimeTrace</b> 生成 · 数据来自 <b>RustTimeNoter</b> · __GEN__ · 原作者：RustTimeNoter</footer>
+  <footer>由 <b>时迹 TimeTrace</b> 生成 · 数据来自 <b>RustTimeNoter</b> · __GEN__ · 作者：Weisifengbuxi</footer>
 </div>
 <div class="tip" id="tip"></div>
 <script id="data" type="application/json">__DATA__</script>
@@ -2869,5 +2869,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
