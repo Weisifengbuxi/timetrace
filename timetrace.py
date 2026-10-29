@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.3.0"
+VERSION = "2.3.1"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -873,7 +873,9 @@ input:focus{outline:2px solid rgba(47,109,237,.22);border-color:var(--accent)}
 .usbmark{position:absolute;top:0;bottom:0;width:0;border-left:2px dashed #0f766e;opacity:.85;z-index:2;pointer-events:auto}
 .lifemark{position:absolute;top:0;bottom:0;width:0;border-left:2px solid #e5484d;opacity:.9;z-index:4;pointer-events:auto}
 .lifemark.ok{border-left-color:#30a46c}
-.lifespan{position:absolute;top:0;bottom:0;background:rgba(229,72,77,.16);z-index:1;pointer-events:none}
+.lifespan{position:absolute;top:0;bottom:0;min-width:5px;z-index:6;pointer-events:auto;
+  background:repeating-linear-gradient(45deg,#e5484d 0 3px,#ffc9c9 3px 6px);
+  box-shadow:inset 0 0 0 1px #b42318}
 .lifebad{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:#fee4e2;color:#b42318}
 .lifeok{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;background:#e7f6ec;color:#087443}
 .usbmark::after{content:"";position:absolute;top:2px;left:-4px;width:6px;height:6px;border-radius:50%;background:#0f766e}
@@ -1019,8 +1021,8 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     </table>
     <div class="note" style="margin-top:10px">
       记录器被<b>手动停止</b>、退出或<b>程序被删除</b>时，这里会留一条记录，
-      并在当天色带上用<b style="color:#e5484d">红色竖线</b>标出来；停止期间的时间段会整段染红。
-      检查靠一个常驻的小进程（登录自启，每分钟看一眼，几乎不占 CPU）。
+      并在当天色带上用<b style="color:#b42318">红色斜纹</b>标出中断的那段区间（正常记录不标注）。
+      检查靠一个常驻的小进程（登录自启，等记录器进程退出，几乎不占 CPU）。
     </div>
   </div>
 
@@ -1052,6 +1054,7 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     连续使用超过十几分钟的时段，色带上会直接贴出应用图标。<br>
     点<b>日期那一行</b>可以展开/收起当天的完整会话表（上面的开关决定默认是否收起）。
     灰色斜纹 = 有记录但未归属到应用的空档；空白 = 完全没有记录（关机 / 睡眠 / 记录器未运行）。
+    <b style="color:#b42318">红色斜纹</b> = 记录器被停止 / 删除的那段区间（重点标出来）。
     相邻的同一应用记录（间隔 ≤ 3 秒）已合并成一段。
   </div>
   <footer>由 <b>时迹 TimeTrace</b> 生成 · 数据来自 <b>RustTimeNoter</b> · __GEN__ · 作者：Weisifengbuxi</footer>
@@ -1208,7 +1211,7 @@ function ribbonHtml(d){
     segs += '<div class="seg gap" style="left:' + pct(s.t/DAY) + '%;width:calc(' + pct(s.d/DAY) + '% + 0.7px)"></div>';
   }
   return '<div class="ribbon" data-day="' + d.date + '"><div class="segbase" style="position:absolute;inset:0"></div>'
-       + segs + usbMarksHtml(d) + lifeSpansHtml(d) + lifeMarksHtml(d) + '<div class="cursorline"></div></div>';
+       + segs + usbMarksHtml(d) + lifeSpansHtml(d) + '<div class="cursorline"></div></div>';
 }
 
 /* U 盘接入在色带上的标记 */
@@ -1248,8 +1251,10 @@ function lifeSpansHtml(d){
   if (!list) return "";
   var h = "";
   for (var i = 0; i < list.length; i++){
-    h += '<div class="lifespan" style="left:' + (list[i].t / DAY * 100).toFixed(3)
-       + '%;width:calc(' + (list[i].d / DAY * 100).toFixed(3) + '% + 0.5px)" title="这段时间记录器没有运行"></div>';
+    var s = list[i];
+    h += '<div class="lifespan" style="left:' + (s.t / DAY * 100).toFixed(3)
+       + '%;width:calc(' + (s.d / DAY * 100).toFixed(3) + '% + 0.5px)"'
+       + ' title="记录中断：' + hms(s.t) + ' 起，持续 ' + durTxt(s.d) + '（这段时间没有记录）"></div>';
   }
   return h;
 }
@@ -1327,6 +1332,11 @@ function dayHtml(d){
     + '<span class="sep">·</span>空档 ' + durTxt(st.gap)
     + '<span class="sep">·</span>未记录 ' + durTxt(st.untracked)
     + '</div>';
+  var spList = LIFE_SPANS[d.date];
+  if (spList && spList.length){
+    sub = sub.replace('</div>',
+      '<span class="sep">·</span><b style="color:#b42318">记录中断 ' + spList.length + ' 次</b></div>');
+  }
 
   var chips = "";
   for (var i = 0; i < d.app_totals.length; i++) chips += chipHtml(d.app_totals[i][0], d.app_totals[i][1]);
@@ -2489,23 +2499,28 @@ def set_tray_enabled(enabled):
 
 
 def choose_tray():
-    """安装时问一次：托盘里显不显示图标。不是终端就默认显示。"""
+    """安装时问一次：托盘里显不显示图标。回车 = 保持当前设置。"""
+    cur = tray_enabled()
+    cur_txt = "显示" if cur else "不显示"
     print()
     print("  右下角托盘图标（RustTimeNoter 那个）要显示吗？")
-    print("    1) 显示（默认）—— 右键就能打开时间线、停止记录")
+    print("    1) 显示 —— 右键就能打开时间线、停止记录")
     print("    2) 不显示 —— 托盘里完全看不到它")
     print("       代价：以后要停止记录、看报表，只能在「时迹」这个程序里操作")
     print("       适合：希望它一直安静跑着、不想让人在托盘里发现的人")
     try:
-        answer = input("  选择 [1/2，回车=1]：").strip()
+        answer = input("  选择 [1/2，回车=保持当前「%s」]：" % cur_txt).strip()
     except (EOFError, KeyboardInterrupt):
         answer = ""
     if answer == "2":
         set_tray_enabled(False)
         print("  已选择：不显示托盘图标")
-    else:
+    elif answer == "1":
         set_tray_enabled(True)
         print("  已选择：显示托盘图标")
+    else:
+        set_tray_enabled(cur)
+        print("  保持当前设置：%s托盘图标" % cur_txt)
 
 
 def restart_tracker():
@@ -3540,6 +3555,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
