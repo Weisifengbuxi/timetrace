@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.8.0"
+VERSION = "2.9.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -3559,6 +3559,13 @@ def cmd_install(args):
     except Exception:  # noqa: BLE001
         pass
     time.sleep(0.5)
+    native_src = bundled_ttwatch()
+    if native_src:
+        try:
+            shutil.copy2(native_src, installed_ttwatch())
+        except OSError:
+            pass
+
     if getattr(sys, "frozen", False):
         me = os.path.abspath(sys.executable)
         target = os.path.join(tt_dir, "TimeTrace.exe")
@@ -3675,6 +3682,12 @@ def cmd_uninstall(args):
                 subprocess.run([dst_tracker] + cmd, capture_output=True, timeout=30)
             except (OSError, subprocess.SubprocessError):
                 pass
+    try:
+        subprocess.run(["taskkill", "/IM", "ttwatch.exe", "/F"], capture_output=True, timeout=15,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        os.remove(installed_ttwatch())
+    except (OSError, subprocess.SubprocessError):
+        pass
     print("[2/3] 恢复原版 tracker.exe（如果有备份）…")
     bak = os.path.join(bin_dir, "tracker.exe.orig")
     if os.path.isfile(bak):
@@ -3773,6 +3786,24 @@ def watch_once():
             json.dump({"present": present, "running": running, "boot": boot}, fp)
     except OSError:
         pass
+
+
+def bundled_ttwatch():
+    """找打包进来的原生看守 ttwatch.exe。"""
+    cands = []
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        cands.append(os.path.join(sys._MEIPASS, "ttwatch.exe"))
+    here = app_dir()
+    cands.append(os.path.join(here, "ttwatch.exe"))
+    cands.append(os.path.join(here, "vendor", "ttwatch", "target", "release", "ttwatch.exe"))
+    for c in cands:
+        if os.path.isfile(c):
+            return c
+    return None
+
+
+def installed_ttwatch():
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "ttwatch.exe")
 
 
 def watch_pid_file():
@@ -4033,6 +4064,9 @@ def write_watch_vbs():
 
 
 def watch_launch_command():
+    native = installed_ttwatch()
+    if os.path.isfile(native):
+        return '"%s"' % native
     if write_watch_vbs():
         return '"%s" //nologo "%s"' % (
             os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "wscript.exe"),
@@ -4043,6 +4077,16 @@ def watch_launch_command():
 
 
 def start_watch_loop():
+    native = installed_ttwatch()
+    if os.path.isfile(native):
+        try:
+            subprocess.Popen([native], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL,
+                             creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                            | getattr(subprocess, "DETACHED_PROCESS", 0)))
+            return True
+        except (OSError, subprocess.SubprocessError):
+            pass
     cmd = watch_launch_command()
     try:
         subprocess.Popen(cmd, shell=False, stdin=subprocess.DEVNULL,
@@ -4056,6 +4100,8 @@ def start_watch_loop():
 
 
 def stop_watch_loop():
+    subprocess.run(["taskkill", "/IM", "ttwatch.exe", "/F"], capture_output=True, timeout=15,
+                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     try:
         with open(watch_pid_file(), encoding="ascii") as fp:
             pid = int(fp.read().strip())
@@ -4168,6 +4214,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 

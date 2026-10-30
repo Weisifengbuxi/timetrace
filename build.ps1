@@ -11,6 +11,7 @@ $common = @(
     "--distpath", "dist", "--workpath", "build\tmp", "--specpath", "build",
     "--icon", (Join-Path $PSScriptRoot "icon.ico"),
     "--add-binary", ((Join-Path $PSScriptRoot "vendor\RustTimeNoter\tracker.exe") + ";RustTimeNoter"),
+    "--add-binary", ((Join-Path $PSScriptRoot "vendor\ttwatch\target\release\ttwatch.exe") + ";."),
     "--hidden-import", "pystray._win32",
     "--exclude-module", "unittest",
     "--exclude-module", "pydoc",
@@ -26,4 +27,5 @@ if (Get-Command py -ErrorAction SilentlyContinue) {
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 Write-Host ""
 Write-Host "Built: dist\TimeTrace.exe" -ForegroundColor Green
+
 
