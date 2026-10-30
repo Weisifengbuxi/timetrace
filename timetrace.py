@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 时迹 TimeTrace — RustTimeNoter 的时间线查看器
@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.7.1"
+VERSION = "2.7.2"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -1308,6 +1308,7 @@ var LIFE_BY_DATE = {};
 var LIFE_SPANS = {};
 function lifeLabel(kind){
   return {installed: "安装", started: "记录器启动", stopped: "记录器停止",
+          stalled: "采集停滞（已自动重启）",
           missing: "记录器被删除", restored: "记录器恢复"}[kind] || kind;
 }
 function lifeMarksHtml(d){
@@ -1316,7 +1317,7 @@ function lifeMarksHtml(d){
   var h = "";
   for (var i = 0; i < list.length; i++){
     var e = list[i];
-    var bad = (e.kind === "stopped" || e.kind === "missing");
+    var bad = (e.kind === "stopped" || e.kind === "missing" || e.kind === "stalled");
     h += '<div class="lifemark' + (bad ? "" : " ok") + '" style="left:' + (e.t / DAY * 100).toFixed(3)
        + '%" title="' + lifeLabel(e.kind) + " " + hms(e.t) + '"></div>';
   }
@@ -1340,7 +1341,7 @@ function renderLifecycle(){
   var rows = "";
   for (var i = 0; i < list.length; i++){
     var e = list[i];
-    var bad = (e.kind === "stopped" || e.kind === "missing");
+    var bad = (e.kind === "stopped" || e.kind === "missing" || e.kind === "stalled");
     rows += '<tr><td class="t">' + e.date.slice(5) + " " + hms(e.t) + '</td><td>'
       + (bad ? '<span class="lifebad">' + lifeLabel(e.kind) + '</span>'
              : '<span class="lifeok">' + lifeLabel(e.kind) + '</span>') + '</td></tr>';
@@ -2261,6 +2262,25 @@ def open_live(port=LIVE_PORT):
     return url
 
 
+def live_pid_file():
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "live.pid")
+
+
+def stop_live_server():
+    """实时视图占用着已安装的 exe，升级前要先停掉。"""
+    try:
+        with open(live_pid_file(), encoding="ascii") as fp:
+            pid = int(fp.read().strip())
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True, timeout=15,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    try:
+        os.remove(live_pid_file())
+    except OSError:
+        pass
+
+
 def cmd_live(args):
     import http.server
     hide_console()
@@ -2335,6 +2355,12 @@ def cmd_live(args):
                 return
 
     threading.Thread(target=idle_watch, daemon=True).start()
+    try:
+        os.makedirs(os.path.dirname(live_pid_file()), exist_ok=True)
+        with open(live_pid_file(), "w", encoding="ascii") as fp:
+            fp.write(str(os.getpid()))
+    except OSError:
+        pass
     if not getattr(args, "no_open", False):
         try:
             import webbrowser
@@ -2913,6 +2939,11 @@ def interactive_menu():
         return
 
     text, installed = ensure_daemon()
+    try:
+        if not os.path.isfile(watch_pid_file()):
+            install_watch_task()
+    except Exception:  # noqa: BLE001
+        pass
     daemon, today = status_summary(text)
     if installed:
         print("已为 RustTimeNoter 开启开机自启（之后开机就自动记录）。")
@@ -3380,9 +3411,13 @@ def cmd_install(args):
                 time.sleep(0.5)
 
     print("[2/5] 复制程序到 LOCALAPPDATA …")
-    # 常驻检查进程正占用着已安装的 exe，先停掉再覆盖
+    # 常驻检查进程 / 实时视图都占用着已安装的 exe，先停掉再覆盖
     try:
         stop_watch_loop()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        stop_live_server()
     except Exception:  # noqa: BLE001
         pass
     time.sleep(0.5)
@@ -3443,15 +3478,31 @@ def cmd_install(args):
         pass
 
     print("[6/6] 启动记录器 …")
-    try:
-        flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                 | getattr(subprocess, "DETACHED_PROCESS", 0))
-        subprocess.Popen([dst_tracker, "run"], stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                         creationflags=flags)
-    except (OSError, subprocess.SubprocessError):
-        pass
-    time.sleep(1.5)
+    started = False
+    for attempt in range(3):
+        try:
+            flags = (getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                     | getattr(subprocess, "DETACHED_PROCESS", 0))
+            subprocess.Popen([dst_tracker, "run"], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             creationflags=flags)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        for _ in range(20):
+            time.sleep(0.5)
+            try:
+                probe = subprocess.run([dst_tracker, "status"], capture_output=True, timeout=15)
+                if b"RUNNING" in probe.stdout.upper():
+                    started = True
+                    break
+            except (OSError, subprocess.SubprocessError):
+                pass
+        if started:
+            break
+        time.sleep(2)
+    if not started:
+        print("      记录器没能启动，稍后打开时迹会自动再试一次。")
+    time.sleep(0.5)
 
     append_lifecycle("installed", "安装 / 更新完成")
     install_watch_task()
@@ -3638,6 +3689,62 @@ def find_tracker_pid():
         k32.CloseHandle(snap)
 
 
+def idle_seconds():
+    """距离最后一次键鼠输入过了多少秒；取不到返回 None。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class LASTINPUTINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+        info = LASTINPUTINFO()
+        info.cbSize = ctypes.sizeof(LASTINPUTINFO)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return None
+        return (ctypes.windll.kernel32.GetTickCount() - info.dwTime) / 1000.0
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def newest_shard_age():
+    """最新日志分片距今多少秒；没有分片返回 None。"""
+    root = os.path.join(os.environ.get("LOCALAPPDATA", ""), "RustTimeNoter", "data")
+    newest = 0.0
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith(".log"):
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(dirpath, name))
+            except OSError:
+                continue
+            if mtime > newest:
+                newest = mtime
+    if not newest:
+        return None
+    return time.time() - newest
+
+
+STALL_WINDOW_SECS = 15 * 60      # 15 分钟没有新数据
+ACTIVE_IDLE_SECS = 180           # 但最近 3 分钟内有输入
+
+
+def restart_recorder():
+    try:
+        exe = find_tracker()
+    except SystemExit:
+        return False
+    try:
+        subprocess.run([exe], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL,
+                       creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                      | getattr(subprocess, "DETACHED_PROCESS", 0)))
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def watch_loop():
     """常驻：等 tracker 进程句柄退出（内核事件），不轮询、不启动子进程。"""
     hide_console()
@@ -3696,7 +3803,23 @@ def watch_loop():
                     was_running = True
                     _write_state(state_path, present, True, boot)
                 if handle:
-                    rc = k32.WaitForSingleObject(handle, 20000)
+                    rc = k32.WaitForSingleObject(handle, 60000)
+                    if rc == WAIT_TIMEOUT:
+                        # 记录器还活着：看看是不是「在跑但采集停了」
+                        try:
+                            idle = idle_seconds()
+                            age = newest_shard_age()
+                            if (idle is not None and idle < ACTIVE_IDLE_SECS
+                                    and age is not None and age > STALL_WINDOW_SECS):
+                                append_lifecycle("stalled", "记录器在运行但长时间没有新记录，已自动重启")
+                                try:
+                                    subprocess.run([find_tracker(), "stop"], capture_output=True, timeout=15)
+                                except Exception:  # noqa: BLE001
+                                    pass
+                                time.sleep(2)
+                                restart_recorder()
+                        except Exception:  # noqa: BLE001
+                            pass
                     if rc == WAIT_OBJECT_0:
                         append_lifecycle("stopped", "记录器停止运行（手动退出或被结束）")
                         k32.CloseHandle(handle)
@@ -3907,6 +4030,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
