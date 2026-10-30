@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.6.1"
+VERSION = "2.6.2"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -3551,13 +3551,45 @@ def cmd_watch(args):
     watch_once()
 
 
-def watch_launch_command():
+def watch_exe_cmd():
+    """要执行的命令行（不含 vbs 包装）。"""
     installed = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "TimeTrace.exe")
     if os.path.isfile(installed):
-        return '"%s" watch --loop' % installed
+        return installed, "watch --loop"
     if getattr(sys, "frozen", False):
-        return '"%s" watch --loop' % os.path.abspath(sys.executable)
-    return '"%s" "%s" watch --loop' % (sys.executable, os.path.abspath(__file__))
+        return os.path.abspath(sys.executable), "watch --loop"
+    return sys.executable, '"%s" watch --loop' % os.path.abspath(__file__)
+
+
+def watch_vbs_path():
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "watch.vbs")
+
+
+def write_watch_vbs():
+    """用 wscript 启动，彻底不闪控制台（开机时 exe 直启会闪一下黑框）。"""
+    exe, args = watch_exe_cmd()
+    args = args.replace('"', '""')
+    line = (
+        'CreateObject("WScript.Shell").Run Chr(34) & "%s" & Chr(34) & " %s", 0, False\r\n'
+        % (exe, args)
+    )
+    try:
+        os.makedirs(os.path.dirname(watch_vbs_path()), exist_ok=True)
+        with open(watch_vbs_path(), "w", encoding="utf-16") as fp:
+            fp.write(line)
+        return True
+    except OSError:
+        return False
+
+
+def watch_launch_command():
+    if write_watch_vbs():
+        return '"%s" //nologo "%s"' % (
+            os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "wscript.exe"),
+            watch_vbs_path(),
+        )
+    exe, args = watch_exe_cmd()
+    return '"%s" %s' % (exe, args)
 
 
 def start_watch_loop():
@@ -3685,6 +3717,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
