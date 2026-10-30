@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.9.0"
+VERSION = "2.9.1"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -2524,21 +2524,12 @@ def cmd_html(args):
         model["usb"] = load_usb_events(ef, et)
         model["usbfiles"] = load_recent_usb_files()
         model["usbdl"] = load_usb_downloads()
-    if not args.out and not os.environ.get("TT_STATIC"):
-        # 默认打开实时视图：永远是最新数据，页面每分钟自动刷新
-        url = open_live()
-        print("实时视图：%s" % url)
-        print("覆盖 %s 至 %s，共 %d 天、%d 条会话。"
-              % (days[0]["date"], days[-1]["date"], len(days),
-                 sum(d["stats"]["sessions"] for d in days)))
-        print("（页面每 60 秒自动刷新；加 --out 文件.html 可以导出静态单文件）")
-        return
     if args.out:
         out = os.path.abspath(args.out)
         with open(out, "w", encoding="utf-8") as fp:
             fp.write(render_html(model, "index"))
     else:
-        outdir = os.path.join(tempfile.gettempdir(), "时迹_时间线")
+        outdir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "report")
         os.makedirs(outdir, exist_ok=True)
         for name, view, title in (
             ("index.html", "index", "时迹 · 总览"),
@@ -3021,18 +3012,47 @@ def recorder_running():
     return "running" in _run_tracker(["status"]).lower()
 
 
+def open_vbs_path():
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "open.vbs")
+
+
+def write_open_vbs():
+    exe = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "TimeTrace.exe")
+    if not os.path.isfile(exe):
+        return False
+    line = (
+        'CreateObject("WScript.Shell").Run Chr(34) & "%s" & Chr(34) & " html", 0, False\r\n'
+        % exe
+    )
+    try:
+        os.makedirs(os.path.dirname(open_vbs_path()), exist_ok=True)
+        with open(open_vbs_path(), "w", encoding="utf-16") as fp:
+            fp.write(line)
+        return True
+    except OSError:
+        return False
+
+
 def create_desktop_shortcut():
     if os.name != "nt":
         return False
     exe = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "TimeTrace.exe")
     if not os.path.isfile(exe):
         return False
+    write_open_vbs()
+    target = exe
+    arguments = ""
+    if os.path.isfile(open_vbs_path()):
+        target = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"),
+                              "System32", "wscript.exe")
+        arguments = '//nologo "%s"' % open_vbs_path()
     script = (
         "$desk=[Environment]::GetFolderPath('Desktop');"
         "$p=Join-Path $desk '时迹.lnk';"
         "$s=(New-Object -ComObject WScript.Shell).CreateShortcut($p);"
-        "$s.TargetPath='%s';$s.WorkingDirectory='%s';$s.IconLocation='%s';$s.Save()"
-        % (exe, os.path.dirname(exe), exe)
+        "$s.TargetPath='%s';$s.Arguments='%s';$s.WorkingDirectory='%s';"
+        "$s.IconLocation='%s';$s.Save()"
+        % (target, arguments.replace("'", "''"), os.path.dirname(exe), exe)
     )
     try:
         subprocess.run(
@@ -4214,6 +4234,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
