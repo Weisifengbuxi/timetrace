@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.9.1"
+VERSION = "2.9.2"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -2511,7 +2511,23 @@ def cmd_live(args):
         pass
 
 
+REPORT_CACHE_SECS = 120
+
+
 def cmd_html(args):
+    outdir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "report")
+    index_path = os.path.join(outdir, "index.html")
+    if not args.out and not getattr(args, "force", False) and os.path.isfile(index_path):
+        age = time.time() - os.path.getmtime(index_path)
+        if age < REPORT_CACHE_SECS:
+            print("直接打开 %d 秒前生成的报告（要强制刷新加 --force）" % int(age))
+            if not getattr(args, "no_open", False) and not os.environ.get("TT_NO_OPEN"):
+                try:
+                    os.startfile(index_path)  # noqa: S606
+                except (AttributeError, OSError):
+                    import webbrowser
+                    webbrowser.open("file:///" + index_path.replace("\\", "/"))
+            return
     auto_prune(args)
     f, t = resolve_range(args)
     records = export_records(f, t)
@@ -2529,7 +2545,6 @@ def cmd_html(args):
         with open(out, "w", encoding="utf-8") as fp:
             fp.write(render_html(model, "index"))
     else:
-        outdir = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "report")
         os.makedirs(outdir, exist_ok=True)
         for name, view, title in (
             ("index.html", "index", "时迹 · 总览"),
@@ -2773,7 +2788,8 @@ def build_parser():
 
     h = sub.add_parser("html", help="打开实时视图（默认）或导出静态 HTML")
     add_range(h)
-    h.add_argument("--out", help="输出 HTML 路径（给了就导出静态文件，不开实时视图）")
+    h.add_argument("--out", help="输出 HTML 路径（给了就导出静态文件）")
+    h.add_argument("--force", action="store_true", help="忽略缓存，强制重新生成")
     h.add_argument("--no-open", action="store_true", help="只生成文件，不打开浏览器")
     h.add_argument("--no-icons", action="store_true", help="不提取应用图标，页面里只用色块")
     h.add_argument("--no-events", action="store_true", help="不读取 U 盘接入记录")
@@ -4234,6 +4250,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
