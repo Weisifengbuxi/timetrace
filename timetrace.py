@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.6.3"
+VERSION = "2.7.1"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -498,9 +498,15 @@ def export_records(from_day, to_day):
             "--from", from_day.isoformat(),
             "--to", to_day.isoformat(),
         ]
-        proc = subprocess.run(cmd, capture_output=True)
+        proc = None
+        for attempt in range(4):
+            proc = subprocess.run(cmd, capture_output=True)
+            if os.path.isfile(out):
+                break
+            time.sleep(1.0 + attempt)
         if not os.path.isfile(out):
-            msg = (proc.stdout or b"") + (proc.stderr or b"")
+            msg = (proc.stdout or b"") if proc else b""
+            msg += (proc.stderr or b"") if proc else b""
             sys.exit("导出失败：\n" + msg.decode("utf-8", "replace").strip())
         with open(out, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -2187,6 +2193,160 @@ def cmd_prune(args):
     print()
 
 
+# --------------------------------------------------------------------------
+# 实时视图（本地 HTTP，打开就是最新数据）
+# --------------------------------------------------------------------------
+LIVE_PORT = 47821
+
+AUTORELOAD_JS = (
+    "<script>(function(){try{var y=sessionStorage.getItem('tt.scroll');"
+    "if(y!==null){window.scrollTo(0,parseInt(y,10));sessionStorage.removeItem('tt.scroll');}}catch(e){}"
+    "setInterval(function(){try{sessionStorage.setItem('tt.scroll',window.scrollY);}catch(e){}"
+    "location.reload();},60000);})();</script>"
+)
+
+
+def port_open(port):
+    import socket
+    s = socket.socket()
+    s.settimeout(0.3)
+    try:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+    finally:
+        s.close()
+
+
+def report_model(args):
+    f, t = resolve_range(args)
+    records = export_records(f, t)
+    days = build_days(records)
+    if not days:
+        raise SystemExit("这段时间（%s 至 %s）没有任何记录。" % (f, t))
+    model = build_model(days, with_icons=not getattr(args, "no_icons", False))
+    if not getattr(args, "no_events", False):
+        ef, et = event_range(args, t)
+        model["usb"] = load_usb_events(ef, et)
+        model["usbfiles"] = load_recent_usb_files()
+        model["usbdl"] = load_usb_downloads()
+    return model, days
+
+
+def live_url(port=LIVE_PORT):
+    return "http://127.0.0.1:%d/" % port
+
+
+def open_live(port=LIVE_PORT):
+    """确保实时视图在跑，然后打开浏览器。"""
+    url = live_url(port)
+    if not port_open(port):
+        base = [os.path.abspath(sys.executable)] if getattr(sys, "frozen", False) else [os.path.abspath(sys.executable), os.path.abspath(__file__)]
+        cmd = base + ["live", "--no-open", "--port", str(port)]
+        try:
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, env=clean_child_env(),
+                             creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                                            | getattr(subprocess, "DETACHED_PROCESS", 0)))
+        except (OSError, subprocess.SubprocessError):
+            pass
+        for _ in range(60):
+            if port_open(port):
+                break
+            time.sleep(0.25)
+    if not os.environ.get("TT_NO_OPEN"):
+        try:
+            import webbrowser
+            webbrowser.open(url)
+        except Exception:  # noqa: BLE001
+            pass
+    return url
+
+
+def cmd_live(args):
+    import http.server
+    hide_console()
+    port = int(getattr(args, "port", LIVE_PORT) or LIVE_PORT)
+    if port_open(port):
+        if not getattr(args, "no_open", False):
+            try:
+                import webbrowser
+                webbrowser.open(live_url(port))
+            except Exception:  # noqa: BLE001
+                pass
+        return
+
+    cache = {"ts": 0, "pages": None, "last": time.time()}
+    base = _ns(no_icons=getattr(args, "no_icons", False), no_events=getattr(args, "no_events", False))
+
+    def pages():
+        now = time.time()
+        if cache["pages"] and now - cache["ts"] < 20:
+            return cache["pages"]
+        model, _days = report_model(base)
+        cache["pages"] = {
+            "index": render_html(model, "index", "时迹 · 总览"),
+            "detail": render_html(model, "detail", "时迹 · 明细"),
+        }
+        cache["ts"] = now
+        return cache["pages"]
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_GET(self):
+            cache["last"] = time.time()
+            path = self.path.split("?")[0]
+            if path == "/favicon.ico":
+                self.send_response(204)
+                self.end_headers()
+                return
+            try:
+                html = pages()["detail" if path.startswith("/detail") else "index"]
+                html = html.replace("</body>", AUTORELOAD_JS + "</body>")
+                data = html.encode("utf-8")
+                self.send_response(200)
+            except SystemExit as exc:
+                data = ("<meta charset='utf-8'><h3 style='font-family:sans-serif'>%s</h3>" % exc).encode("utf-8")
+                self.send_response(200)
+            except Exception as exc:  # noqa: BLE001
+                data = ("<meta charset='utf-8'><h3 style='font-family:sans-serif'>暂时读不到记录：%s</h3>"
+                        "<p style='font-family:sans-serif;color:#666'>记录器可能刚重启，页面会自动重试。</p>"
+                        % exc).encode("utf-8")
+                self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    http.server.ThreadingHTTPServer.allow_reuse_address = True
+    try:
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError:
+        return
+
+    import threading
+
+    def idle_watch():
+        while True:
+            time.sleep(60)
+            if time.time() - cache["last"] > 1800:  # 30 分钟没人看就退出
+                httpd.shutdown()
+                return
+
+    threading.Thread(target=idle_watch, daemon=True).start()
+    if not getattr(args, "no_open", False):
+        try:
+            import webbrowser
+            webbrowser.open(live_url(port))
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
 def cmd_html(args):
     auto_prune(args)
     f, t = resolve_range(args)
@@ -2200,6 +2360,15 @@ def cmd_html(args):
         model["usb"] = load_usb_events(ef, et)
         model["usbfiles"] = load_recent_usb_files()
         model["usbdl"] = load_usb_downloads()
+    if not args.out and not os.environ.get("TT_STATIC"):
+        # 默认打开实时视图：永远是最新数据，页面每分钟自动刷新
+        url = open_live()
+        print("实时视图：%s" % url)
+        print("覆盖 %s 至 %s，共 %d 天、%d 条会话。"
+              % (days[0]["date"], days[-1]["date"], len(days),
+                 sum(d["stats"]["sessions"] for d in days)))
+        print("（页面每 60 秒自动刷新；加 --out 文件.html 可以导出静态单文件）")
+        return
     if args.out:
         out = os.path.abspath(args.out)
         with open(out, "w", encoding="utf-8") as fp:
@@ -2447,13 +2616,21 @@ def build_parser():
                         help="日志保留天数（默认 30，超期分片会被自动删除）")
         sp.add_argument("--no-prune", action="store_true", help="这次不要清理过期日志")
 
-    h = sub.add_parser("html", help="生成“打开即全部展开”的时间线并打开浏览器")
+    h = sub.add_parser("html", help="打开实时视图（默认）或导出静态 HTML")
     add_range(h)
-    h.add_argument("--out", help="输出 HTML 路径")
+    h.add_argument("--out", help="输出 HTML 路径（给了就导出静态文件，不开实时视图）")
     h.add_argument("--no-open", action="store_true", help="只生成文件，不打开浏览器")
     h.add_argument("--no-icons", action="store_true", help="不提取应用图标，页面里只用色块")
     h.add_argument("--no-events", action="store_true", help="不读取 U 盘接入记录")
     h.set_defaults(func=cmd_html)
+
+    lv = sub.add_parser("live", help="本地实时视图（打开就是最新数据，页面每分钟自动刷新）")
+    add_range(lv)
+    lv.add_argument("--port", type=int, default=LIVE_PORT, help="端口，默认 47821")
+    lv.add_argument("--no-open", action="store_true", help="不打开浏览器")
+    lv.add_argument("--no-icons", action="store_true")
+    lv.add_argument("--no-events", action="store_true")
+    lv.set_defaults(func=cmd_live)
 
     d = sub.add_parser("day", help="控制台打印某天的时间流水")
     add_range(d, default_days=7)
@@ -2941,12 +3118,22 @@ def tray_base_command():
     return [sys.executable, os.path.abspath(__file__)]
 
 
+def clean_child_env():
+    """从自身启动自身时，别让子进程复用父进程的 _MEI 临时目录（父进程退出会删掉它）。"""
+    env = dict(os.environ)
+    for key in list(env):
+        if key.startswith("_MEI") or key.startswith("_PYI"):
+            env.pop(key, None)
+    env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+    return env
+
+
 def spawn_engine(arg_list, console=True):
     """以子进程运行自己（菜单里的各项操作）。console=True 时弹一个控制台窗口。"""
     cmd = tray_base_command() + list(arg_list)
     flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if console else getattr(subprocess, "CREATE_NO_WINDOW", 0)
     try:
-        subprocess.Popen(cmd, creationflags=flags, close_fds=True)
+        subprocess.Popen(cmd, creationflags=flags, close_fds=True, env=clean_child_env())
     except (OSError, subprocess.SubprocessError):
         pass
 
@@ -3599,6 +3786,7 @@ def start_watch_loop():
     try:
         subprocess.Popen(cmd, shell=False, stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         env=clean_child_env(),
                          creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
                                         | getattr(subprocess, "DETACHED_PROCESS", 0)))
         return True
@@ -3719,6 +3907,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 

@@ -1,4 +1,4 @@
-# Build TimeTrace.exe with PyInstaller.
+﻿# Build TimeTrace.exe with PyInstaller.
 #   powershell -ExecutionPolicy Bypass -File build.ps1
 # Requires: Python 3.9+ and  pip install pyinstaller pystray pillow
 
@@ -14,9 +14,6 @@ $common = @(
     "--hidden-import", "pystray._win32",
     "--exclude-module", "unittest",
     "--exclude-module", "pydoc",
-    "--exclude-module", "email",
-    "--exclude-module", "http",
-    "--exclude-module", "xml",
     "timetrace.py"
 )
 
@@ -29,3 +26,4 @@ if (Get-Command py -ErrorAction SilentlyContinue) {
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 Write-Host ""
 Write-Host "Built: dist\TimeTrace.exe" -ForegroundColor Green
+
