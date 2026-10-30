@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 时迹 TimeTrace — RustTimeNoter 的时间线查看器
@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.7.2"
+VERSION = "2.8.0"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -810,6 +810,111 @@ def lifecycle_spans(days, life):
     return out
 
 
+# --------------------------------------------------------------------------
+# 关机 / 无活动 区间
+# --------------------------------------------------------------------------
+IDLE_MIN_SECS = 30 * 60
+
+
+def load_power_events(start_day, end_day):
+    """Windows 事件日志里的开机 / 关机时刻。"""
+    if os.name != "nt":
+        return []
+    script = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "Get-WinEvent -FilterHashtable @{LogName='System'; Id=12,13,1074,6006,6008;"
+        "StartTime='%s 00:00:00'; EndTime='%s 23:59:59'} | "
+        "Sort-Object TimeCreated | ForEach-Object { "
+        "'{0}|{1}' -f $_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'), $_.Id }"
+        % (start_day.isoformat(), end_day.isoformat())
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+             base64.b64encode(script.encode("utf-16-le")).decode("ascii")],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    out = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if "|" not in line:
+            continue
+        ts, _, eid = line.partition("|")
+        try:
+            dt = datetime.strptime(ts.strip(), "%Y-%m-%d %H:%M:%S")
+            eid = int(eid.strip())
+        except ValueError:
+            continue
+        if eid in (12,):
+            out.append((dt, "boot"))
+        elif eid in (13, 6006, 6008):
+            # 1074 只是「有人点了关机」，可能被取消；只有 13/6006/6008 才是真的关机
+            if out and out[-1][1] == "shutdown" and (dt - out[-1][0]).total_seconds() < 120:
+                continue
+            out.append((dt, "shutdown"))
+    return out
+
+
+def shutdown_spans(events):
+    spans = []
+    off = None
+    for dt, kind in events:
+        if kind == "shutdown" and off is None:
+            off = dt
+        elif kind == "boot" and off is not None:
+            spans.append((off, dt))
+            off = None
+    if off is not None:
+        spans.append((off, None))
+    return spans
+
+
+def idle_spans(days, events, min_secs=IDLE_MIN_SECS):
+    """每天里「没有任何记录」的空洞；能对上关机时间的标成 shutdown。"""
+    offs = shutdown_spans(events)
+    out = []
+    for d in days:
+        try:
+            base = datetime.combine(date.fromisoformat(d["date"]), dtime(0, 0))
+        except ValueError:
+            continue
+        covered = []
+        for s in d["sessions"]:
+            covered.append((s["t"], s["t"] + s["d"]))
+        for g in d.get("gaps") or []:
+            covered.append((g["t"], g["t"] + g["d"]))
+        covered.sort()
+        merged = []
+        for a, b in covered:
+            if merged and a <= merged[-1][1] + 5:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        holes = []
+        cur = 0
+        for a, b in merged:
+            if a - cur >= min_secs:
+                holes.append((cur, a))
+            cur = max(cur, b)
+        if 86400 - cur >= min_secs:
+            holes.append((cur, 86400))
+        for a, b in holes:
+            start_dt = base + timedelta(seconds=a)
+            end_dt = base + timedelta(seconds=b)
+            kind = "idle"
+            for oa, ob in offs:
+                oe = ob or datetime.max
+                if start_dt < oe and end_dt > oa:
+                    kind = "shutdown"
+                    break
+            out.append({"date": d["date"], "t": int(a), "d": int(b - a), "kind": kind})
+    return out
+
+
 def build_model(days, with_icons=False):
     apps = rank_apps(days)
     color_map = {}
@@ -838,6 +943,15 @@ def build_model(days, with_icons=False):
         model["icons"] = load_icons(apps)
     life = read_lifecycle()
     model["lifecycle"] = lifecycle_events(days, life)
+    try:
+        _span = _model_range(days)
+        if _span is not None:
+            power = load_power_events(_span[0].date(), (_span[1] - timedelta(days=1)).date())
+            model["idleSpans"] = idle_spans(days, power)
+        else:
+            model["idleSpans"] = []
+    except Exception:  # noqa: BLE001
+        model["idleSpans"] = []
     model["lifeSpans"] = lifecycle_spans(days, life)
     model["lifeInterruptions"] = lifecycle_interruption_count(days, life)
     return model
@@ -907,6 +1021,9 @@ body.dark .nav a.on{background:var(--accent);color:#fff}
 .usbmark{position:absolute;top:0;bottom:0;width:0;border-left:2px dashed #0f766e;opacity:.85;z-index:2;pointer-events:auto}
 .lifemark{position:absolute;top:0;bottom:0;width:0;border-left:2px solid #e5484d;opacity:.9;z-index:4;pointer-events:auto}
 .lifemark.ok{border-left-color:#30a46c}
+.idlespan{position:absolute;top:0;bottom:0;z-index:0;pointer-events:auto;opacity:.55}
+.idlespan.shutdown{background:repeating-linear-gradient(45deg,#9aa4b2 0 4px,#e8ebef 4px 8px)}
+.idlespan.idle{background:repeating-linear-gradient(45deg,#f5c94b 0 4px,#fdf3d4 4px 8px)}
 .lifespan{position:absolute;top:0;bottom:0;min-width:5px;z-index:6;pointer-events:auto;
   background:repeating-linear-gradient(45deg,#e5484d 0 3px,#ffc9c9 3px 6px);
   box-shadow:inset 0 0 0 1px #b42318}
@@ -1129,7 +1246,8 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     连续使用超过十几分钟的时段，色带上会直接贴出应用图标。<br>
     点<b>日期那一行</b>可以展开/收起当天的完整会话表（上面的开关决定默认是否收起）。
     灰色斜纹 = 有记录但未归属到应用的空档；空白 = 完全没有记录（关机 / 睡眠 / 记录器未运行）。
-    <b style="color:#b42318">红色斜纹</b> = 记录器被停止 / 删除的那段区间（重点标出来）。
+    <b style="color:#b42318">红色斜纹</b> = 记录器被停止 / 删除的那段区间（重点标出来）；
+    <b>灰色斜纹</b> = 电脑关机；<b style="color:#a16207">黄色斜纹</b> = 没有活动（锁屏 / 睡眠 / 离开）。
     相邻的同一应用记录（间隔 ≤ 3 秒）已合并成一段。
   </div>
   <footer>由 <b>时迹 TimeTrace</b> 生成 · 数据来自 <b>RustTimeNoter</b> · __GEN__ · 作者：Weisifengbuxi</footer>
@@ -1287,7 +1405,7 @@ function ribbonHtml(d){
     segs += '<div class="seg gap" style="left:' + pct(s.t/DAY) + '%;width:calc(' + pct(s.d/DAY) + '% + 0.7px)"></div>';
   }
   return '<div class="ribbon" data-day="' + d.date + '"><div class="segbase" style="position:absolute;inset:0"></div>'
-       + segs + usbMarksHtml(d) + lifeSpansHtml(d) + '<div class="cursorline"></div></div>';
+       + idleSpansHtml(d) + segs + usbMarksHtml(d) + lifeSpansHtml(d) + '<div class="cursorline"></div></div>';
 }
 
 /* U 盘接入在色带上的标记 */
@@ -1311,6 +1429,22 @@ function lifeLabel(kind){
           stalled: "采集停滞（已自动重启）",
           missing: "记录器被删除", restored: "记录器恢复"}[kind] || kind;
 }
+/* 关机 / 无活动 区间 */
+var IDLE_BY_DATE = {};
+function idleSpansHtml(d){
+  var list = IDLE_BY_DATE[d.date];
+  if (!list) return "";
+  var h = "";
+  for (var i = 0; i < list.length; i++){
+    var s = list[i];
+    var label = s.kind === "shutdown" ? "电脑关机" : "没有活动（锁屏 / 睡眠 / 离开）";
+    h += '<div class="idlespan ' + s.kind + '" style="left:' + (s.t / DAY * 100).toFixed(3)
+       + '%;width:calc(' + (s.d / DAY * 100).toFixed(3) + '% + 0.5px)" title="'
+       + label + "：" + hms(s.t) + " 起 " + durTxt(s.d) + '"></div>';
+  }
+  return h;
+}
+
 function lifeMarksHtml(d){
   var list = LIFE_BY_DATE[d.date];
   if (!list) return "";
@@ -1872,6 +2006,10 @@ indexUsb();
   for (i = 0; i < lc.length; i++){
     e = lc[i];
     (LIFE_BY_DATE[e.date] = LIFE_BY_DATE[e.date] || []).push(e);
+  }
+  var ids = M.idleSpans || [];
+  for (i = 0; i < ids.length; i++){
+    (IDLE_BY_DATE[ids[i].date] = IDLE_BY_DATE[ids[i].date] || []).push(ids[i]);
   }
   var sp = M.lifeSpans || [];
   for (i = 0; i < sp.length; i++){
@@ -4030,6 +4168,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
