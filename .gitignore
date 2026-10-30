@@ -4,3 +4,5 @@ build/
 dist/
 *.spec
 *.exe
+
+vendor/ttwatch/target/
