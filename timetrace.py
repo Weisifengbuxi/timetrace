@@ -31,11 +31,11 @@ import tempfile
 import time
 import unicodedata
 from collections import defaultdict
-from datetime import date, datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta, timezone
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.9.2"
+VERSION = "2.9.3"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -822,7 +822,7 @@ def load_power_events(start_day, end_day):
         return []
     script = (
         "$ErrorActionPreference='SilentlyContinue';"
-        "Get-WinEvent -FilterHashtable @{LogName='System'; Id=12,13,1074,6006,6008;"
+        "Get-WinEvent -FilterHashtable @{LogName='System'; Id=12,13,6006,6008;"
         "StartTime='%s 00:00:00'; EndTime='%s 23:59:59'} | "
         "Sort-Object TimeCreated | ForEach-Object { "
         "'{0}|{1}' -f $_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'), $_.Id }"
@@ -849,7 +849,7 @@ def load_power_events(start_day, end_day):
             eid = int(eid.strip())
         except ValueError:
             continue
-        if eid in (12,):
+        if eid == 12:
             out.append((dt, "boot"))
         elif eid in (13, 6006, 6008):
             # 1074 只是「有人点了关机」，可能被取消；只有 13/6006/6008 才是真的关机
@@ -857,6 +857,48 @@ def load_power_events(start_day, end_day):
                 continue
             out.append((dt, "shutdown"))
     return out
+
+
+def load_sleep_events(start_day, end_day):
+    """Power-Troubleshooter 记录着精确的睡眠 / 唤醒时间（UTC）。"""
+    if os.name != "nt":
+        return []
+    script = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "Get-WinEvent -FilterHashtable @{LogName='System';"
+        "ProviderName='Microsoft-Windows-Power-Troubleshooter'; Id=1;"
+        "StartTime='%s 00:00:00'; EndTime='%s 23:59:59'} | ForEach-Object { "
+        "$m = ($_.Message -replace '[\u200e\u200f\u202a-\u202e]', '');"
+        "$s = [regex]::Match($m, '(?:睡眠时间|Sleep Time)[:：]\\s*(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2})');"
+        "$w = [regex]::Match($m, '(?:唤醒时间|Wake Time)[:：]\\s*(\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2})');"
+        "if ($s.Success -and $w.Success) { 'sleep|' + $s.Groups[1].Value + '|' + $w.Groups[1].Value } }"
+        % (start_day.isoformat(), end_day.isoformat())
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+             base64.b64encode(script.encode("utf-16-le")).decode("ascii")],
+            capture_output=True,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    spans = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.strip().split("|")
+        if len(parts) != 3 or parts[0] != "sleep":
+            continue
+        try:
+            a = datetime.strptime(parts[1], "%Y-%m-%dT%H:%M:%S")
+            b = datetime.strptime(parts[2], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+        a = (a.replace(tzinfo=timezone.utc)).astimezone().replace(tzinfo=None)
+        b = (b.replace(tzinfo=timezone.utc)).astimezone().replace(tzinfo=None)
+        if b > a:
+            spans.append((a, b))
+    return spans
 
 
 def shutdown_spans(events):
@@ -873,8 +915,9 @@ def shutdown_spans(events):
     return spans
 
 
-def idle_spans(days, events, min_secs=IDLE_MIN_SECS):
-    """每天里「没有任何记录」的空洞；能对上关机时间的标成 shutdown。"""
+def idle_spans(days, events, min_secs=IDLE_MIN_SECS, sleeps=None):
+    """每天里「没有任何记录」的空洞；能对上关机 / 睡眠的分别标出来。"""
+    sleeps = sleeps or []
     offs = shutdown_spans(events)
     out = []
     for d in days:
@@ -911,6 +954,11 @@ def idle_spans(days, events, min_secs=IDLE_MIN_SECS):
                 if start_dt < oe and end_dt > oa:
                     kind = "shutdown"
                     break
+            if kind == "idle":
+                for oa, ob in sleeps:
+                    if start_dt < ob and end_dt > oa:
+                        kind = "sleep"
+                        break
             out.append({"date": d["date"], "t": int(a), "d": int(b - a), "kind": kind})
     return out
 
@@ -946,8 +994,11 @@ def build_model(days, with_icons=False):
     try:
         _span = _model_range(days)
         if _span is not None:
-            power = load_power_events(_span[0].date(), (_span[1] - timedelta(days=1)).date())
-            model["idleSpans"] = idle_spans(days, power)
+            d0 = _span[0].date()
+            d1 = (_span[1] - timedelta(days=1)).date()
+            power = load_power_events(d0, d1)
+            sleeps = load_sleep_events(d0, d1)
+            model["idleSpans"] = idle_spans(days, power, sleeps=sleeps)
         else:
             model["idleSpans"] = []
     except Exception:  # noqa: BLE001
@@ -1024,6 +1075,7 @@ body.dark .nav a.on{background:var(--accent);color:#fff}
 .idlespan{position:absolute;top:0;bottom:0;z-index:0;pointer-events:auto;opacity:.55}
 .idlespan.shutdown{background:repeating-linear-gradient(45deg,#9aa4b2 0 4px,#e8ebef 4px 8px)}
 .idlespan.idle{background:repeating-linear-gradient(45deg,#f5c94b 0 4px,#fdf3d4 4px 8px)}
+.idlespan.sleep{background:repeating-linear-gradient(45deg,#7aa7ff 0 4px,#e3ecff 4px 8px)}
 .lifespan{position:absolute;top:0;bottom:0;min-width:5px;z-index:6;pointer-events:auto;
   background:repeating-linear-gradient(45deg,#e5484d 0 3px,#ffc9c9 3px 6px);
   box-shadow:inset 0 0 0 1px #b42318}
@@ -1247,7 +1299,8 @@ footer{color:#98a2b3;font-size:11.5px;text-align:center;margin-top:10px}
     点<b>日期那一行</b>可以展开/收起当天的完整会话表（上面的开关决定默认是否收起）。
     灰色斜纹 = 有记录但未归属到应用的空档；空白 = 完全没有记录（关机 / 睡眠 / 记录器未运行）。
     <b style="color:#b42318">红色斜纹</b> = 记录器被停止 / 删除的那段区间（重点标出来）；
-    <b>灰色斜纹</b> = 电脑关机；<b style="color:#a16207">黄色斜纹</b> = 没有活动（锁屏 / 睡眠 / 离开）。
+    <b>灰色斜纹</b> = 电脑关机；<b style="color:#2f6ded">蓝色斜纹</b> = 睡眠 / 休眠；
+    <b style="color:#a16207">黄色斜纹</b> = 其它没有活动（锁屏 / 离开）。
     相邻的同一应用记录（间隔 ≤ 3 秒）已合并成一段。
   </div>
   <footer>由 <b>时迹 TimeTrace</b> 生成 · 数据来自 <b>RustTimeNoter</b> · __GEN__ · 作者：Weisifengbuxi</footer>
@@ -1437,7 +1490,8 @@ function idleSpansHtml(d){
   var h = "";
   for (var i = 0; i < list.length; i++){
     var s = list[i];
-    var label = s.kind === "shutdown" ? "电脑关机" : "没有活动（锁屏 / 睡眠 / 离开）";
+    var label = s.kind === "shutdown" ? "电脑关机"
+              : (s.kind === "sleep" ? "电脑睡眠 / 休眠" : "没有活动（锁屏 / 离开）");
     h += '<div class="idlespan ' + s.kind + '" style="left:' + (s.t / DAY * 100).toFixed(3)
        + '%;width:calc(' + (s.d / DAY * 100).toFixed(3) + '% + 0.5px)" title="'
        + label + "：" + hms(s.t) + " 起 " + durTxt(s.d) + '"></div>';
@@ -4250,6 +4304,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
