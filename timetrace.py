@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.9.3"
+VERSION = "2.9.4"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -822,7 +822,7 @@ def load_power_events(start_day, end_day):
         return []
     script = (
         "$ErrorActionPreference='SilentlyContinue';"
-        "Get-WinEvent -FilterHashtable @{LogName='System'; Id=12,13,6006,6008;"
+        "Get-WinEvent -FilterHashtable @{LogName='System'; Id=12,13,6006,6008,1074,7002;"
         "StartTime='%s 00:00:00'; EndTime='%s 23:59:59'} | "
         "Sort-Object TimeCreated | ForEach-Object { "
         "'{0}|{1}' -f $_.TimeCreated.ToString('yyyy-MM-dd HH:mm:ss'), $_.Id }"
@@ -852,10 +852,13 @@ def load_power_events(start_day, end_day):
         if eid == 12:
             out.append((dt, "boot"))
         elif eid in (13, 6006, 6008):
-            # 1074 只是「有人点了关机」，可能被取消；只有 13/6006/6008 才是真的关机
+            # 13/6006/6008 是「真关机」的硬证据
             if out and out[-1][1] == "shutdown" and (dt - out[-1][0]).total_seconds() < 120:
                 continue
             out.append((dt, "shutdown"))
+        elif eid in (1074, 7002):
+            # 关机/注销信号：可能被取消，单独当成 hint，用来区分「关机」和「睡眠」
+            out.append((dt, "hint"))
     return out
 
 
@@ -919,12 +922,18 @@ def idle_spans(days, events, min_secs=IDLE_MIN_SECS, sleeps=None):
     """每天里「没有任何记录」的空洞；能对上关机 / 睡眠的分别标出来。"""
     sleeps = sleeps or []
     offs = shutdown_spans(events)
+    hints = [dt for dt, kind in events if kind == "hint"]
     out = []
     for d in days:
         try:
             base = datetime.combine(date.fromisoformat(d["date"]), dtime(0, 0))
         except ValueError:
             continue
+        # 今天还没过完：只标到「现在」，不要把未来也算成没有活动
+        day_end = 86400
+        now_dt = datetime.now()
+        if base.date() == now_dt.date():
+            day_end = max(0, int((now_dt - base).total_seconds()))
         covered = []
         for s in d["sessions"]:
             covered.append((s["t"], s["t"] + s["d"]))
@@ -943,8 +952,9 @@ def idle_spans(days, events, min_secs=IDLE_MIN_SECS, sleeps=None):
             if a - cur >= min_secs:
                 holes.append((cur, a))
             cur = max(cur, b)
-        if 86400 - cur >= min_secs:
-            holes.append((cur, 86400))
+        if day_end - cur >= min_secs:
+            holes.append((cur, day_end))
+        holes = [(a, min(b, day_end)) for a, b in holes if a < day_end]
         for a, b in holes:
             start_dt = base + timedelta(seconds=a)
             end_dt = base + timedelta(seconds=b)
@@ -958,6 +968,13 @@ def idle_spans(days, events, min_secs=IDLE_MIN_SECS, sleeps=None):
                 for oa, ob in sleeps:
                     if start_dt < ob and end_dt > oa:
                         kind = "sleep"
+                        sleep_start = oa
+                        break
+            if kind == "sleep":
+                # 快速启动下，「关机」在日志里表现为一次短暂的睡眠 + 之前的注销/关机信号
+                for h in hints:
+                    if -180 <= (h - sleep_start).total_seconds() <= 30:
+                        kind = "shutdown"
                         break
             out.append({"date": d["date"], "t": int(a), "d": int(b - a), "kind": kind})
     return out
@@ -4304,6 +4321,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
