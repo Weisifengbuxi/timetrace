@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.9.4"
+VERSION = "2.9.5"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -965,16 +965,17 @@ def idle_spans(days, events, min_secs=IDLE_MIN_SECS, sleeps=None):
                     kind = "shutdown"
                     break
             if kind == "idle":
-                for oa, ob in sleeps:
-                    if start_dt < ob and end_dt > oa:
-                        kind = "sleep"
-                        sleep_start = oa
-                        break
+                matched = [oa for oa, ob in sleeps if start_dt < ob and end_dt > oa]
+                if matched:
+                    kind = "sleep"
             if kind == "sleep":
                 # 快速启动下，「关机」在日志里表现为一次短暂的睡眠 + 之前的注销/关机信号
-                for h in hints:
-                    if -180 <= (h - sleep_start).total_seconds() <= 30:
-                        kind = "shutdown"
+                for oa in sorted(matched):
+                    for h in hints:
+                        if -180 <= (h - oa).total_seconds() <= 30:
+                            kind = "shutdown"
+                            break
+                    if kind == "shutdown":
                         break
             out.append({"date": d["date"], "t": int(a), "d": int(b - a), "kind": kind})
     return out
@@ -4321,6 +4322,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
