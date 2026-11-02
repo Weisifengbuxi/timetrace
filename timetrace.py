@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.9.5"
+VERSION = "2.9.6"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -751,6 +751,59 @@ def lifecycle_events(days, life):
     return out
 
 
+def _record_coverage(days):
+    """每天「有记录」的时间段（合并后的区间）。"""
+    cov = {}
+    for d in days:
+        segs = [(s["t"], s["t"] + s["d"]) for s in d["sessions"]]
+        segs += [(g["t"], g["t"] + g["d"]) for g in (d.get("gaps") or [])]
+        segs.sort()
+        merged = []
+        for a, b in segs:
+            if merged and a <= merged[-1][1] + 5:
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+        cov[d["date"]] = merged
+    return cov
+
+
+def filter_life_spans(spans, idle, days):
+    """红带只留在「确认没有记录」的地方：先减去有记录的时间，再去掉落在关机/睡眠里的。"""
+    cov = _record_coverage(days)
+    out = []
+    for s in spans:
+        day = s["date"]
+        pieces = [(s["t"], s["t"] + s["d"])]
+        for a, b in cov.get(day, []):
+            nxt = []
+            for x, y in pieces:
+                if b <= x or a >= y:
+                    nxt.append((x, y))
+                    continue
+                if x < a:
+                    nxt.append((x, a))
+                if y > b:
+                    nxt.append((b, y))
+            pieces = nxt
+        # 只保留「停止之后、第一条记录之前」的那一段：
+        # 中间又冒出记录说明记录器其实在跑（多半漏了 started 事件），后面不该再涂红。
+        for x, y in pieces[:1]:
+            if y - x < 60:          # 一分钟以内的碎片不画
+                continue
+            covered = False
+            for i in idle:
+                if i["date"] != day or i["kind"] not in ("shutdown", "sleep"):
+                    continue
+                ia, ib = i["t"], i["t"] + i["d"]
+                if min(y, ib) - max(x, ia) >= 0.9 * (y - x):
+                    covered = True
+                    break
+            if not covered:
+                out.append({"date": day, "t": int(x), "d": int(y - x)})
+    return out
+
+
 def lifecycle_interruption_count(days, life):
     """区间内「记录中断」的次数（一次停止 → 一次恢复算一次）。"""
     rng = _model_range(days)
@@ -773,11 +826,26 @@ def lifecycle_interruption_count(days, life):
     return n
 
 
+def _record_starts(days):
+    out = []
+    for d in days:
+        try:
+            base = datetime.combine(date.fromisoformat(d["date"]), dtime(0, 0))
+        except ValueError:
+            continue
+        for s in d["sessions"]:
+            out.append(base + timedelta(seconds=s["t"]))
+    out.sort()
+    return out
+
+
 def lifecycle_spans(days, life):
     rng = _model_range(days)
     if rng is None:
         return []
     lo, hi = rng
+    starts = _record_starts(days)
+    now = datetime.now()
     raw = []
     open_dt = None
     for r in life:
@@ -789,7 +857,14 @@ def lifecycle_spans(days, life):
                 raw.append((open_dt, r["dt"]))
                 open_dt = None
     if open_dt is not None:
-        raw.append((open_dt, hi))
+        # 只有「停止」没有「启动」：用之后第一条记录来收尾，
+        # 否则会把后面整段（甚至未来）都涂成中断
+        end = None
+        for s in starts:
+            if s > open_dt:
+                end = s
+                break
+        raw.append((open_dt, end or min(now, hi)))
     out = []
     for a, b in raw:
         s = max(a, lo)
@@ -1021,8 +1096,8 @@ def build_model(days, with_icons=False):
             model["idleSpans"] = []
     except Exception:  # noqa: BLE001
         model["idleSpans"] = []
-    model["lifeSpans"] = lifecycle_spans(days, life)
-    model["lifeInterruptions"] = lifecycle_interruption_count(days, life)
+    model["lifeSpans"] = filter_life_spans(lifecycle_spans(days, life), model["idleSpans"], days)
+    model["lifeInterruptions"] = len([s for s in model["lifeSpans"] if s["d"] > 0])
     return model
 
 
@@ -3758,6 +3833,8 @@ def cmd_install(args):
     time.sleep(0.5)
 
     append_lifecycle("installed", "安装 / 更新完成")
+    if started:
+        append_lifecycle("started", "安装后启动记录器")
     install_watch_task()
     create_desktop_shortcut()
     try:
@@ -4322,6 +4399,8 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
 
 
 
