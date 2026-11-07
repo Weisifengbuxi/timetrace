@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 时迹 TimeTrace — RustTimeNoter 的时间线查看器
@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.9.6"
+VERSION = "2.9.7"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -3007,6 +3007,48 @@ def setup_console():
         pass
 
 
+def _fd_broken(fd):
+    try:
+        os.fstat(fd)
+        return False
+    except OSError:
+        return True
+
+
+def fix_console_handles():
+    """托盘启动时我们继承了「没有控制台」的句柄：窗口是新的，但 stdin 是坏的，
+    input() 立刻 EOF，窗口一闪就关。这里把 CONIN$/CONOUT$ 接回来。
+
+    只修「句柄本身坏了」的情况；stdin 是管道（正常传参）时保持不动。
+    """
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        if not ctypes.windll.kernel32.GetConsoleWindow():
+            return
+    except Exception:  # noqa: BLE001
+        return
+    broken_in = _fd_broken(0)
+    broken_out = _fd_broken(1)
+    if not broken_in and not broken_out:
+        return
+    try:
+        fin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+        fout = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
+    except OSError:
+        return
+    try:
+        os.dup2(fin.fileno(), 0)
+        os.dup2(fout.fileno(), 1)
+        os.dup2(fout.fileno(), 2)
+    except OSError:
+        return
+    sys.stdin = fin
+    sys.stdout = fout
+    sys.stderr = fout
+
+
 # --------------------------------------------------------------------------
 # 一体化入口：确保记录器在跑 + 交互菜单
 # --------------------------------------------------------------------------
@@ -4353,6 +4395,7 @@ def remove_watch_task():
 
 def main():
     setup_console()
+    fix_console_handles()
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -4399,6 +4442,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
