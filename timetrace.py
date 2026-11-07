@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.9.8"
+VERSION = "2.9.9"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -4428,6 +4428,19 @@ def remove_watch_task():
         pass
 
 
+def show_own_console():
+    """把本进程的控制台窗口提到最前，避免它开在别的窗口后面让人以为没反应。"""
+    try:
+        import ctypes
+        u32 = ctypes.windll.user32
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            u32.ShowWindow(hwnd, 9)
+            u32.SetForegroundWindow(hwnd)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def startup_log(msg):
     try:
         path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "startup.log")
@@ -4483,6 +4496,8 @@ def main():
             pass
     parser = build_parser()
     args = parser.parse_args()
+    if getattr(args, "pause", False):
+        show_own_console()
     if getattr(args, "pause", False) or not getattr(args, "cmd", None):
         try:
             info = _console_probe()
@@ -4524,6 +4539,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
