@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 时迹 TimeTrace — RustTimeNoter 的时间线查看器
@@ -35,7 +35,7 @@ from datetime import date, datetime, time as dtime, timedelta, timezone
 
 APP_NAME = "时迹"
 APP_NAME_EN = "TimeTrace"
-VERSION = "2.9.7"
+VERSION = "2.9.8"
 APP_TITLE = "时迹 · 操作时间线"
 
 # 日志保留天数：超过这个天数的数据分片会被自动删除
@@ -3015,38 +3015,73 @@ def _fd_broken(fd):
         return True
 
 
-def fix_console_handles():
+def _console_debug(msg):
+    path = os.environ.get("TT_CONSOLE_DEBUG")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+    except OSError:
+        pass
+
+
+def _console_probe():
+    """返回 (有控制台窗口, stdin 类型, stdin 是否控制台, stdin 坏没坏)。"""
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    FILE_TYPE_PIPE = 3
+    FILE_TYPE_DISK = 1
+    info = {"window": bool(k32.GetConsoleWindow()), "types": [], "console": [], "broken": []}
+    for fd in (0, 1):
+        h = k32.GetStdHandle(-10 if fd == 0 else -11)
+        info["types"].append(k32.GetFileType(h))
+        mode = ctypes.c_uint32()
+        info["console"].append(bool(k32.GetConsoleMode(h, ctypes.byref(mode))))
+        info["broken"].append(_fd_broken(fd))
+    info["pipe_or_file"] = any(t in (FILE_TYPE_PIPE, FILE_TYPE_DISK) for t in info["types"])
+    return info
+
+
+def fix_console_handles(force=False):
     """托盘启动时我们继承了「没有控制台」的句柄：窗口是新的，但 stdin 是坏的，
     input() 立刻 EOF，窗口一闪就关。这里把 CONIN$/CONOUT$ 接回来。
 
-    只修「句柄本身坏了」的情况；stdin 是管道（正常传参）时保持不动。
+    - 有控制台窗口，但 stdin/stdout 不是控制台、也不是管道/文件 → 重新接上
+    - 管道或重定向文件（脚本调用）→ 保持原样
     """
     if os.name != "nt":
         return
     try:
-        import ctypes
-        if not ctypes.windll.kernel32.GetConsoleWindow():
-            return
-    except Exception:  # noqa: BLE001
+        info = _console_probe()
+    except Exception as exc:  # noqa: BLE001
+        _console_debug("probe failed: %r" % (exc,))
         return
-    broken_in = _fd_broken(0)
-    broken_out = _fd_broken(1)
-    if not broken_in and not broken_out:
+    _console_debug(
+        "window=%s types=%s console=%s broken=%s pipe_or_file=%s"
+        % (info["window"], info["types"], info["console"], info["broken"], info["pipe_or_file"])
+    )
+    if not info["window"] or info["pipe_or_file"]:
+        return
+    if all(info["console"]) and not force:
         return
     try:
         fin = open("CONIN$", "r", encoding="utf-8", errors="replace")
         fout = open("CONOUT$", "w", encoding="utf-8", errors="replace", buffering=1)
-    except OSError:
+    except OSError as exc:
+        _console_debug("open CONIN$/CONOUT$ failed: %r" % (exc,))
         return
     try:
         os.dup2(fin.fileno(), 0)
         os.dup2(fout.fileno(), 1)
         os.dup2(fout.fileno(), 2)
-    except OSError:
+    except OSError as exc:
+        _console_debug("dup2 failed: %r" % (exc,))
         return
     sys.stdin = fin
     sys.stdout = fout
     sys.stderr = fout
+    _console_debug("rebound to CONIN$/CONOUT$")
 
 
 # --------------------------------------------------------------------------
@@ -4393,6 +4428,50 @@ def remove_watch_task():
         pass
 
 
+def startup_log(msg):
+    try:
+        path = os.path.join(os.environ.get("LOCALAPPDATA", ""), "TimeTrace", "startup.log")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if os.path.isfile(path) and os.path.getsize(path) > 200000:
+            os.replace(path, path + ".1")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("%s %s\n" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except (OSError, ValueError):
+        pass
+
+
+def pause_and_close():
+    """等一下再关窗口；输入不可用时给出可见提示，而不是让窗口无声消失。"""
+    prompt = "\n按回车关闭窗口…"
+    for attempt in (1, 2):
+        try:
+            input(prompt)
+            return
+        except (KeyboardInterrupt, OSError):
+            return
+        except EOFError:
+            startup_log("pause EOF (attempt %d)" % attempt)
+            if attempt == 1:
+                try:
+                    import ctypes
+                    k32 = ctypes.windll.kernel32
+                    if not k32.GetConsoleWindow():
+                        k32.AllocConsole()
+                    fix_console_handles(force=True)
+                except Exception:  # noqa: BLE001
+                    pass
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "这个窗口收不到键盘输入，所以没法继续。\n\n请在命令行里运行：时迹.exe at",
+            "时迹",
+            0x00000040,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def main():
     setup_console()
     fix_console_handles()
@@ -4404,6 +4483,12 @@ def main():
             pass
     parser = build_parser()
     args = parser.parse_args()
+    if getattr(args, "pause", False) or not getattr(args, "cmd", None):
+        try:
+            info = _console_probe()
+        except Exception as exc:  # noqa: BLE001
+            info = "probe failed: %r" % (exc,)
+        startup_log("argv=%s console=%s" % (sys.argv[1:], info))
     if getattr(args, "tray", False):
         run_tray()
         return
@@ -4434,14 +4519,12 @@ def main():
         print()
     finally:
         if getattr(args, "pause", False):
-            try:
-                input("\n按回车关闭窗口…")
-            except (EOFError, KeyboardInterrupt, OSError):
-                pass
+            pause_and_close()
 
 
 if __name__ == "__main__":
     main()
+
 
 
 
